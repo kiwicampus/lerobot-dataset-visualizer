@@ -1,5 +1,5 @@
 import React, { useMemo } from "react";
-import { usePlayback, useTime } from "../context/time-context";
+import { usePlayback, useTime, PLAYBACK_SPEEDS } from "../context/time-context";
 import {
   FaPlay,
   FaPause,
@@ -14,7 +14,8 @@ import { debounce } from "@/utils/debounce";
 
 const PlaybackBar: React.FC = () => {
   const { duration, currentTime, setCurrentTime } = useTime();
-  const { isPlaying, setIsPlaying } = usePlayback();
+  const { isPlaying, setIsPlaying, playbackSpeed, setPlaybackSpeed } =
+    usePlayback();
 
   const sliderActiveRef = React.useRef(false);
   const wasPlayingRef = React.useRef(false);
@@ -118,6 +119,28 @@ const PlaybackBar: React.FC = () => {
       <span className="w-16 text-right tabular-nums text-xs text-slate-200 shrink-0">
         {Math.floor(sliderValue)} / {Math.floor(duration)}
       </span>
+
+      <div
+        className="flex items-center gap-0.5 shrink-0 rounded-lg border border-slate-600 bg-slate-800/80 p-0.5"
+        role="group"
+        aria-label="Playback speed"
+      >
+        {PLAYBACK_SPEEDS.map((speed) => (
+          <button
+            key={speed}
+            type="button"
+            title={`${speed}× speed`}
+            onClick={() => setPlaybackSpeed(speed)}
+            className={`min-w-[2.25rem] rounded-md px-2 py-1 text-xs font-medium tabular-nums transition-colors ${
+              playbackSpeed === speed
+                ? "bg-orange-500 text-slate-950"
+                : "text-slate-300 hover:bg-slate-700"
+            }`}
+          >
+            {speed}×
+          </button>
+        ))}
+      </div>
 
       <div className="text-xs text-slate-300 select-none ml-8 flex-col gap-y-0.5 hidden md:flex">
         <p>

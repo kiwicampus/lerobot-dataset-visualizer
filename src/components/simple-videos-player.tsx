@@ -34,7 +34,7 @@ export const SimpleVideosPlayer = ({
   onVideosReady,
 }: VideoPlayerProps) => {
   const { currentTime, setCurrentTime } = useTime();
-  const { isPlaying, setIsPlaying } = usePlayback();
+  const { isPlaying, setIsPlaying, playbackSpeed } = usePlayback();
   const videoRefs = useRef<(HTMLVideoElement | null)[]>([]);
   const hasSignaledReadyRef = useRef(false);
   const [hiddenVideos, setHiddenVideos] = React.useState<string[]>([]);
@@ -200,6 +200,8 @@ export const SimpleVideosPlayer = ({
       if (!video) return;
       if (hiddenVideos.includes(videosInfo[idx].filename)) return;
 
+      video.playbackRate = playbackSpeed;
+
       if (!isPlaying) {
         video.pause();
         return;
@@ -211,7 +213,7 @@ export const SimpleVideosPlayer = ({
         }
       });
     });
-  }, [isPlaying, videosReady, hiddenVideos, videosInfo]);
+  }, [isPlaying, playbackSpeed, videosReady, hiddenVideos, videosInfo]);
 
   // Sync video times
   useEffect(() => {
