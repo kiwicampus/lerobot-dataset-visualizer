@@ -2,7 +2,11 @@
  * Utility functions for checking dataset version compatibility
  */
 
-const DATASET_URL = process.env.DATASET_URL || "https://huggingface.co/datasets";
+import { getDatasetHostingConfig } from "@/utils/datasetEnv";
+
+function datasetBaseUrl(): string {
+  return getDatasetHostingConfig().baseUrl;
+}
 
 /**
  * Get HuggingFace token from environment or cache
@@ -70,7 +74,7 @@ interface DatasetInfo {
  */
 export async function getDatasetInfo(repoId: string): Promise<DatasetInfo> {
   try {
-    const testUrl = `${DATASET_URL}/${repoId}/resolve/main/meta/info.json`;
+    const testUrl = `${datasetBaseUrl()}/${repoId}/resolve/main/meta/info.json`;
     
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
@@ -144,6 +148,6 @@ export async function getDatasetVersion(repoId: string): Promise<string> {
 }
 
 export function buildVersionedUrl(repoId: string, version: string, path: string): string {
-  return `${DATASET_URL}/${repoId}/resolve/main/${path}`;
+  return `${datasetBaseUrl()}/${repoId}/resolve/main/${path}`;
 }
 

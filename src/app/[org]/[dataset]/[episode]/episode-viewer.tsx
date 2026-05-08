@@ -10,6 +10,10 @@ import { TimeProvider, usePlayback, useTime } from "@/context/time-context";
 import Sidebar from "@/components/side-nav";
 import Loading from "@/components/loading-component";
 import { getAdjacentEpisodesVideoInfo } from "./fetch-data";
+import {
+  pollCuratorAdvance,
+  syncEpisodeToCurator,
+} from "@/utils/curatorBridge";
 
 export default function EpisodeViewer({
   data,
@@ -39,7 +43,20 @@ export default function EpisodeViewer({
   );
 }
 
-function EpisodeViewerInner({ data, org, dataset }: { data: any; org?: string; dataset?: string; }) {
+function indexInEpisodeList(episodes: unknown[], episodeId: unknown): number {
+  const cur = Number(episodeId);
+  return episodes.findIndex((e) => Number(e) === cur);
+}
+
+function EpisodeViewerInner({
+  data,
+  org,
+  dataset,
+}: {
+  data: any;
+  org?: string;
+  dataset?: string;
+}) {
   const {
     datasetInfo,
     episodeId,
@@ -48,6 +65,11 @@ function EpisodeViewerInner({ data, org, dataset }: { data: any; org?: string; d
     episodes,
     task,
   } = data;
+
+  const episodesRef = useRef(episodes);
+  const episodeIdRef = useRef(episodeId);
+  episodesRef.current = episodes;
+  episodeIdRef.current = episodeId;
 
   const [videosReady, setVideosReady] = useState(!videosInfo.length);
   const [chartsReady, setChartsReady] = useState(false);
@@ -113,10 +135,35 @@ function EpisodeViewerInner({ data, org, dataset }: { data: any; org?: string; d
     });
   }, []);
 
+  // Keep PyQt curator episode + language instruction in sync with this page
+  useEffect(() => {
+    syncEpisodeToCurator(episodeId, task ?? "");
+  }, [episodeId, task]);
+
+  // After curator Save, jump to next episode in dataset order (refs = fresh ids; Number() = robust match)
+  useEffect(() => {
+    const id = window.setInterval(async () => {
+      const go = await pollCuratorAdvance();
+      if (!go) return;
+      const eps = episodesRef.current;
+      const cur = episodeIdRef.current;
+      const idx = indexInEpisodeList(eps, cur);
+      if (idx >= 0 && idx < eps.length - 1) {
+        const nextId = eps[idx + 1];
+        const path =
+          org && dataset
+            ? `/${org}/${dataset}/episode_${nextId}`
+            : `./episode_${nextId}`;
+        router.push(path);
+      }
+    }, 350);
+    return () => window.clearInterval(id);
+  }, [router, org, dataset]);
+
   // Initialize based on URL time parameter
   useEffect(() => {
     // Initialize page based on current episode
-    const episodeIndex = episodes.indexOf(episodeId);
+    const episodeIndex = indexInEpisodeList(episodes, episodeId);
     if (episodeIndex !== -1) {
       setCurrentPage(Math.floor(episodeIndex / pageSize) + 1);
     }
@@ -126,7 +173,7 @@ function EpisodeViewerInner({ data, org, dataset }: { data: any; org?: string; d
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [episodes, episodeId, pageSize, searchParams]);
+  }, [episodes, episodeId, pageSize, searchParams, org, dataset, router]);
 
   // Only update URL ?t= param when the integer second changes
   const lastUrlSecondRef = useRef<number>(-1);
@@ -158,15 +205,16 @@ function EpisodeViewerInner({ data, org, dataset }: { data: any; org?: string; d
       setIsPlaying((prev: boolean) => !prev);
     } else if (key === "ArrowDown" || key === "ArrowUp") {
       e.preventDefault();
-      const nextEpisodeId = key === "ArrowDown" ? episodeId + 1 : episodeId - 1;
-      const lowestEpisodeId = episodes[0];
-      const highestEpisodeId = episodes[episodes.length - 1];
-
-      if (
-        nextEpisodeId >= lowestEpisodeId &&
-        nextEpisodeId <= highestEpisodeId
-      ) {
-        router.push(`./episode_${nextEpisodeId}`);
+      const idx = indexInEpisodeList(episodes, episodeId);
+      if (idx === -1) return;
+      const nextIdx = key === "ArrowDown" ? idx + 1 : idx - 1;
+      if (nextIdx >= 0 && nextIdx < episodes.length) {
+        const nextId = episodes[nextIdx];
+        const path =
+          org && dataset
+            ? `/${org}/${dataset}/episode_${nextId}`
+            : `./episode_${nextId}`;
+        router.push(path);
       }
     }
   };

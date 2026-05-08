@@ -1,4 +1,4 @@
-"""Launch the dataset curator desktop UI."""
+"""Launch the dataset curator desktop UI (PyQt + local HTTP bridge for the visualizer)."""
 
 import sys
 from pathlib import Path

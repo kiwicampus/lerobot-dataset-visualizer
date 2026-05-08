@@ -1,4 +1,5 @@
 import { redirect } from "next/navigation";
+import { initialEpisodeIndexFromEnv } from "@/utils/episodeFilter";
 
 export default async function DatasetRootPage({
   params,
@@ -6,10 +7,7 @@ export default async function DatasetRootPage({
   params: Promise<{ org: string; dataset: string }>;
 }) {
   const { org, dataset } = await params;
-  const episodeN = process.env.EPISODES
-    ?.split(/\s+/)
-    .map((x) => parseInt(x.trim(), 10))
-    .filter((x) => !isNaN(x))[0] ?? 0;
+  const episodeN = initialEpisodeIndexFromEnv();
 
   redirect(`/${org}/${dataset}/episode_${episodeN}`);
 }

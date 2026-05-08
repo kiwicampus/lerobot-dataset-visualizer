@@ -8,6 +8,7 @@ import {
 } from "@/utils/parquetUtils";
 import { pick } from "@/utils/pick";
 import { getDatasetVersion, buildVersionedUrl, getAuthHeaders } from "@/utils/versionUtils";
+import { buildVisibleEpisodesList } from "@/utils/episodeFilter";
 
 const SERIES_NAME_DELIMITER = " | ";
 
@@ -27,11 +28,23 @@ export async function getEpisodeData(
       throw new Error("Only videos datasets are supported in this visualizer.\nPlease use Rerun visualizer for images datasets.");
     }
 
+    const episodes = buildVisibleEpisodesList(info.total_episodes);
+    if (episodes.length === 0) {
+      throw new Error(
+        "EPISODES_IDS / EPISODES did not match any episode index in this dataset (check indices vs total_episodes).",
+      );
+    }
+    if (!episodes.includes(episodeId)) {
+      throw new Error(
+        `Episode ${episodeId} is not in the current allowlist. Available indices: ${episodes.join(", ")}.`,
+      );
+    }
+
     // Handle different versions
     if (version === "v3.0") {
-      return await getEpisodeDataV3(repoId, version, info, episodeId);
+      return await getEpisodeDataV3(repoId, version, info, episodeId, episodes);
     } else {
-      return await getEpisodeDataV2(repoId, version, info, episodeId);
+      return await getEpisodeDataV2(repoId, version, info, episodeId, episodes);
     }
   } catch (err) {
     console.error("Error loading episode data:", err);
@@ -51,44 +64,57 @@ export async function getAdjacentEpisodesVideoInfo(
     const version = await getDatasetVersion(repoId);
     const jsonUrl = buildVersionedUrl(repoId, version, "meta/info.json");
     const info = await fetchJson<DatasetMetadata>(jsonUrl);
-    
-    const totalEpisodes = info.total_episodes;
-    const adjacentVideos: Array<{episodeId: number; videosInfo: any[]}> = [];
-    
-    // Calculate adjacent episode IDs
+
+    const visible = buildVisibleEpisodesList(info.total_episodes);
+    const centerIdx = visible.indexOf(currentEpisodeId);
+    const adjacentVideos: Array<{ episodeId: number; videosInfo: any[] }> = [];
+
+    if (centerIdx === -1) {
+      return [];
+    }
+
     for (let offset = -radius; offset <= radius; offset++) {
-      if (offset === 0) continue; // Skip current episode
-      
-      const episodeId = currentEpisodeId + offset;
-      if (episodeId >= 0 && episodeId < totalEpisodes) {
-        try {
-          let videosInfo: any[] = [];
-          
-          if (version === "v3.0") {
-            const episodeMetadata = await loadEpisodeMetadataV3Simple(repoId, version, episodeId);
-            videosInfo = extractVideoInfoV3WithSegmentation(repoId, version, info, episodeMetadata);
-          } else {
-            // For v2.x, use simpler video info extraction
-            const episode_chunk = Math.floor(0 / 1000);
-            videosInfo = Object.entries(info.features)
-              .filter(([, value]) => value.dtype === "video")
-              .map(([key]) => {
-                const videoPath = formatStringWithVars(info.video_path, {
-                  video_key: key,
-                  episode_chunk: episode_chunk.toString().padStart(3, "0"),
-                  episode_index: episodeId.toString().padStart(6, "0"),
-                });
-                return {
-                  filename: key,
-                  url: buildVersionedUrl(repoId, version, videoPath),
-                };
+      if (offset === 0) continue;
+
+      const j = centerIdx + offset;
+      if (j < 0 || j >= visible.length) continue;
+
+      const episodeId = visible[j];
+      try {
+        let videosInfo: any[] = [];
+
+        if (version === "v3.0") {
+          const episodeMetadata = await loadEpisodeMetadataV3Simple(
+            repoId,
+            version,
+            episodeId,
+          );
+          videosInfo = extractVideoInfoV3WithSegmentation(
+            repoId,
+            version,
+            info,
+            episodeMetadata,
+          );
+        } else {
+          const episode_chunk = Math.floor(0 / 1000);
+          videosInfo = Object.entries(info.features)
+            .filter(([, value]) => value.dtype === "video")
+            .map(([key]) => {
+              const videoPath = formatStringWithVars(info.video_path, {
+                video_key: key,
+                episode_chunk: episode_chunk.toString().padStart(3, "0"),
+                episode_index: episodeId.toString().padStart(6, "0"),
               });
-          }
-          
-          adjacentVideos.push({ episodeId, videosInfo });
-                  } catch {
-            // Skip failed episodes silently
-          }
+              return {
+                filename: key,
+                url: buildVersionedUrl(repoId, version, videoPath),
+              };
+            });
+        }
+
+        adjacentVideos.push({ episodeId, videosInfo });
+      } catch {
+        // Skip failed episodes silently
       }
     }
     
@@ -105,6 +131,7 @@ async function getEpisodeDataV2(
   version: string,
   info: DatasetMetadata,
   episodeId: number,
+  episodes: number[],
 ) {
   const episode_chunk = Math.floor(0 / 1000);
 
@@ -116,23 +143,10 @@ async function getEpisodeDataV2(
     fps: info.fps,
   };
 
-  // Generate list of episodes
-  const episodes =
-    process.env.EPISODES === undefined
-      ? Array.from(
-          { length: datasetInfo.total_episodes },
-          // episode id starts from 0
-          (_, i) => i,
-        )
-      : process.env.EPISODES
-          .split(/\s+/)
-          .map((x) => parseInt(x.trim(), 10))
-          .filter((x) => !isNaN(x));
-
-      // Videos information
-    const videosInfo = Object.entries(info.features)
-      .filter(([, value]) => value.dtype === "video")
-      .map(([key]) => {
+  // Videos information
+  const videosInfo = Object.entries(info.features)
+    .filter(([, value]) => value.dtype === "video")
+    .map(([key]) => {
       const videoPath = formatStringWithVars(info.video_path, {
         video_key: key,
         episode_chunk: episode_chunk.toString().padStart(3, "0"),
@@ -425,6 +439,7 @@ async function getEpisodeDataV3(
   version: string,
   info: DatasetMetadata,
   episodeId: number,
+  episodes: number[],
 ) {
   // Create dataset info structure (like v2.x)
   const datasetInfo = {
@@ -433,9 +448,6 @@ async function getEpisodeDataV3(
     total_episodes: info.total_episodes,
     fps: info.fps,
   };
-
-  // Generate episodes list based on total_episodes from dataset info
-  const episodes = Array.from({ length: info.total_episodes }, (_, i) => i);
 
   // Load episode metadata to get timestamps for episode 0
   const episodeMetadata = await loadEpisodeMetadataV3Simple(repoId, version, episodeId);
