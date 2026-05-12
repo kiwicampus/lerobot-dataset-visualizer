@@ -5,6 +5,7 @@ import {
   fetchJson,
   formatStringWithVars,
 } from "@/utils/parquetUtils";
+import { parseJsonResponse } from "@/utils/jsonResponse";
 import { getDatasetVersion, buildVersionedUrl } from "@/utils/versionUtils";
 
 export default async function ExplorePage({
@@ -23,7 +24,7 @@ export default async function ExplorePage({
       },
     );
     if (!res.ok) throw new Error("Failed to fetch datasets");
-    const data = await res.json();
+    const data = await parseJsonResponse<{ datasets?: unknown[] }>(res);
     const allDatasets = data.datasets || data;
     // Use searchParams from props
     const page = parseInt(searchParams?.p || "1", 10);

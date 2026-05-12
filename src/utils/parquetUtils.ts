@@ -1,4 +1,5 @@
 import { parquetRead, parquetReadObjects } from "hyparquet";
+import { parseJsonResponse } from "./jsonResponse";
 import { getAuthHeaders } from "./versionUtils";
 
 export interface DatasetMetadata {
@@ -34,7 +35,7 @@ export async function fetchJson<T>(url: string): Promise<T> {
       `Failed to fetch JSON ${url}: ${res.status} ${res.statusText}`,
     );
   }
-  return res.json() as Promise<T>;
+  return parseJsonResponse<T>(res);
 }
 
 export function formatStringWithVars(

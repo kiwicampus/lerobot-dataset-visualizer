@@ -128,6 +128,12 @@ const SingleDataGraph = React.memo(
       return chartData.length - 1;
     };
 
+    const playheadTime = hoveredTime != null ? hoveredTime : currentTime;
+    const closestIndex = useMemo(
+      () => findClosestDataIndex(playheadTime),
+      [chartData, playheadTime],
+    );
+
     const handleMouseLeave = () => {
       setHoveredTime(null);
     };
@@ -141,9 +147,6 @@ const SingleDataGraph = React.memo(
 
     // Custom legend to show current value next to each series
     const CustomLegend = () => {
-      const closestIndex = findClosestDataIndex(
-        hoveredTime != null ? hoveredTime : currentTime,
-      );
       const currentData = chartData[closestIndex] || {};
 
       // Parse dataKeys into groups (dot notation)
@@ -299,9 +302,7 @@ const SingleDataGraph = React.memo(
                 content={() => null}
                 active={true}
                 isAnimationActive={false}
-                defaultIndex={
-                  !hoveredTime ? findClosestDataIndex(currentTime) : undefined
-                }
+                defaultIndex={!hoveredTime ? closestIndex : undefined}
               />
 
               {/* Render lines for visible dataKeys only */}

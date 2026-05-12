@@ -14,16 +14,18 @@ npm install next@15.3.6 ( in case errors appear in the install)
 pip install -r dataset_curator/requirements.txt
 ```
 
-Export HF_TOKEN and start the visualizer: 
+Run the curation tool:
+```bash 
+    python3 dataset_curator/main.py
+```
+
+Export HF_TOKEN, REPO_ID and EPISODE_IDS and run visualizer: 
 
 ```bash 
    export HF_TOKEN=<token>
-   nmp run dev
-```
-
-In another terminal run:
-```bash 
-    python3 dataset_curator/main.py
+   export REPO_ID=<id>
+   export EPISODES_IDS=<start,end>
+   npm run dev
 ```
 
 Open [http://localhost:3000](http://localhost:3000) with your browser and access the dataset repo

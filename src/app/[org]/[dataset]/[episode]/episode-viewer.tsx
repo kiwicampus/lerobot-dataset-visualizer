@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef, useCallback } from "react";
-import { useRouter, useSearchParams } from "next/navigation";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { postParentMessageWithParams } from "@/utils/postParentMessage";
 import { SimpleVideosPlayer } from "@/components/simple-videos-player";
 import DataRecharts from "@/components/data-recharts";
@@ -11,9 +11,11 @@ import Sidebar from "@/components/side-nav";
 import Loading from "@/components/loading-component";
 import { getAdjacentEpisodesVideoInfo } from "./fetch-data";
 import {
+  curatorBridgeLog,
   pollCuratorAdvance,
   syncEpisodeToCurator,
 } from "@/utils/curatorBridge";
+import { getProxiedVideoUrl } from "@/utils/videoProxy";
 
 export default function EpisodeViewer({
   data,
@@ -73,6 +75,7 @@ function EpisodeViewerInner({
 
   const [videosReady, setVideosReady] = useState(!videosInfo.length);
   const [chartsReady, setChartsReady] = useState(false);
+  const [preloadVideos, setPreloadVideos] = useState<string[]>([]);
   const isLoading = !videosReady || !chartsReady;
 
   // Keep callbacks stable so children don't re-render / re-init on every time tick.
@@ -85,6 +88,7 @@ function EpisodeViewerInner({
   }, [setChartsReady]);
 
   const router = useRouter();
+  const pathname = usePathname();
   const searchParams = useSearchParams();
 
   // State
@@ -101,14 +105,21 @@ function EpisodeViewerInner({
     currentPage * pageSize,
   );
 
-  // Preload adjacent episodes' videos
+  // Preload next episodes' videos so high-speed playback works immediately after navigation
   useEffect(() => {
     if (!org || !dataset) return;
+    setPreloadVideos([]);
 
     const preloadAdjacent = async () => {
       try {
-        await getAdjacentEpisodesVideoInfo(org, dataset, episodeId, 2);
-        // Preload adjacent episodes for smoother navigation
+        const adjacent = await getAdjacentEpisodesVideoInfo(org, dataset, episodeId, 2);
+        const currentIdx = indexInEpisodeList(episodes, episodeId);
+        const urls = adjacent
+          .filter(({ episodeId: id }) => indexInEpisodeList(episodes, id) > currentIdx)
+          .flatMap(({ videosInfo: vInfo }) =>
+            vInfo.map((v: any) => getProxiedVideoUrl(v.url))
+          );
+        setPreloadVideos(urls);
       } catch {
         // Skip preloading on error
       }
@@ -135,30 +146,64 @@ function EpisodeViewerInner({
     });
   }, []);
 
-  // Keep PyQt curator episode + language instruction in sync with this page
+  // PyQt curator: episode index + language instruction (URL wins so navigation updates immediately)
   useEffect(() => {
-    syncEpisodeToCurator(episodeId, task ?? "");
-  }, [episodeId, task]);
+    const fromPath = pathname.match(/\/episode_(\d+)/);
+    const id = fromPath
+      ? Number(fromPath[1])
+      : Number(episodeId);
+    if (!Number.isFinite(id)) return;
+    syncEpisodeToCurator(id, typeof task === "string" ? task : "");
+  }, [pathname, episodeId, task]);
 
-  // After curator Save, jump to next episode in dataset order (refs = fresh ids; Number() = robust match)
+  // After curator Save, jump to next episode in dataset order. Serial polls (no overlapping
+  // setInterval + async) so one GET /poll consumes advance=true reliably; URL wins for "current".
   useEffect(() => {
-    const id = window.setInterval(async () => {
-      const go = await pollCuratorAdvance();
-      if (!go) return;
-      const eps = episodesRef.current;
-      const cur = episodeIdRef.current;
-      const idx = indexInEpisodeList(eps, cur);
-      if (idx >= 0 && idx < eps.length - 1) {
-        const nextId = eps[idx + 1];
-        const path =
-          org && dataset
-            ? `/${org}/${dataset}/episode_${nextId}`
-            : `./episode_${nextId}`;
-        router.push(path);
+    let cancelled = false;
+    let timeoutId: ReturnType<typeof setTimeout>;
+
+    const schedule = () => {
+      timeoutId = window.setTimeout(run, 350);
+    };
+
+    async function run() {
+      if (cancelled) return;
+      try {
+        const go = await pollCuratorAdvance();
+        if (!go) return;
+
+        const eps = episodesRef.current;
+        const fromUrl = pathname.match(/\/episode_(\d+)/);
+        const cur = fromUrl
+          ? Number(fromUrl[1])
+          : Number(episodeIdRef.current);
+        const idx = indexInEpisodeList(eps, cur);
+
+        if (idx >= 0 && idx < eps.length - 1) {
+          const nextId = eps[idx + 1];
+          const path =
+            org && dataset
+              ? `/${org}/${dataset}/episode_${nextId}`
+              : `./episode_${nextId}`;
+          curatorBridgeLog("advance → router.push", { cur, nextId, idx, path });
+          router.push(path);
+        } else {
+          console.warn(
+            "[CuratorBridge:viz] advance=true but cannot go to next episode",
+            { cur, idx, episodesLen: eps?.length, pathname },
+          );
+        }
+      } finally {
+        if (!cancelled) schedule();
       }
-    }, 350);
-    return () => window.clearInterval(id);
-  }, [router, org, dataset]);
+    }
+
+    schedule();
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeoutId);
+    };
+  }, [router, org, dataset, pathname]);
 
   // Initialize based on URL time parameter
   useEffect(() => {
@@ -313,6 +358,33 @@ function EpisodeViewerInner({
 
         <PlaybackBar />
       </div>
+
+      {/* Hidden video elements to warm the HTTP cache for next episodes */}
+      {preloadVideos.map((url) => {
+        const label = `[Preload] ${url.split("videos%2F").pop()?.split("%2F").slice(0, 2).join("/") ?? url.slice(-40)}`;
+        const t0 = performance.now();
+        const getBuffered = (v: HTMLVideoElement) =>
+          v.buffered.length ? (v.buffered.end(v.buffered.length - 1) - v.buffered.start(0)).toFixed(2) : "0.00";
+        return (
+          <video
+            key={url}
+            src={url}
+            preload="auto"
+            muted
+            playsInline
+            style={{ position: "absolute", width: 0, height: 0, opacity: 0, pointerEvents: "none" }}
+            onLoadStart={(e) => console.log(`${label} | loadstart`)}
+            onProgress={(e) => {
+              const v = e.currentTarget;
+              console.log(`${label} | progress @ ${(performance.now() - t0).toFixed(0)}ms | buffered=${getBuffered(v)}s | networkState=${v.networkState}`);
+            }}
+            onCanPlayThrough={(e) => {
+              const v = e.currentTarget;
+              console.log(`${label} | canplaythrough @ ${(performance.now() - t0).toFixed(0)}ms | buffered=${getBuffered(v)}s`);
+            }}
+          />
+        );
+      })}
     </div>
   );
 }

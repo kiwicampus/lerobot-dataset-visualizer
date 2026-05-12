@@ -1,19 +1,15 @@
 "use client";
 
-import React, { useEffect, useRef } from "react";
+import React, { useEffect, useRef, useCallback } from "react";
 import { usePlayback, useTime } from "../context/time-context";
 import { FaExpand, FaCompress, FaTimes, FaEye } from "react-icons/fa";
+import { getProxiedVideoUrl } from "@/utils/videoProxy";
 
-/**
- * Convert a HuggingFace video URL to use the local proxy for authentication.
- * This allows private dataset videos to be played in the browser.
- */
-function getProxiedVideoUrl(url: string): string {
-  if (url.startsWith("https://huggingface.co/")) {
-    return `/api/video-proxy?url=${encodeURIComponent(url)}`;
-  }
-  return url;
-}
+/** Wall-clock interval between global time updates while playing (~20 Hz). */
+const CLOCK_EMIT_MS = 50;
+/** When speeding up, wait until this many seconds are buffered ahead (scaled by rate). */
+const SPEED_UP_BUFFER_AHEAD_SEC = 2.5;
+const SPEED_UP_WAIT_MS = 4500;
 
 type VideoInfo = {
   filename: string;
@@ -29,6 +25,31 @@ type VideoPlayerProps = {
   onVideosReady?: () => void;
 };
 
+function bufferedAheadSeconds(video: HTMLVideoElement): number {
+  if (!video.buffered.length) return 0;
+  const t = video.currentTime;
+  for (let i = 0; i < video.buffered.length; i++) {
+    const start = video.buffered.start(i);
+    const end = video.buffered.end(i);
+    if (t >= start && t <= end) {
+      return Math.max(0, end - t);
+    }
+    if (t < start) return 0;
+  }
+  return Math.max(0, video.buffered.end(video.buffered.length - 1) - t);
+}
+
+function globalTimeFromVideo(
+  video: HTMLVideoElement,
+  info: VideoInfo | undefined,
+): number {
+  if (!info) return video.currentTime;
+  if (info.isSegmented) {
+    return video.currentTime - (info.segmentStart || 0);
+  }
+  return video.currentTime;
+}
+
 export const SimpleVideosPlayer = ({
   videosInfo,
   onVideosReady,
@@ -41,17 +62,29 @@ export const SimpleVideosPlayer = ({
   const [enlargedVideo, setEnlargedVideo] = React.useState<string | null>(null);
   const [showHiddenMenu, setShowHiddenMenu] = React.useState(false);
   const [videosReady, setVideosReady] = React.useState(false);
+  const [speedBuffering, setSpeedBuffering] = React.useState(false);
+
+  const prevPlaybackSpeedRef = useRef(playbackSpeed);
+  const speedUpAbortRef = useRef<AbortController | null>(null);
 
   const firstVisibleIdx = videosInfo.findIndex(
-    (video) => !hiddenVideos.includes(video.filename)
+    (video) => !hiddenVideos.includes(video.filename),
   );
+
+  const flushMasterTimeToContext = useCallback(() => {
+    const idx = firstVisibleIdx;
+    if (idx < 0) return;
+    const video = videoRefs.current[idx];
+    const info = videosInfo[idx];
+    if (!video) return;
+    setCurrentTime(globalTimeFromVideo(video, info));
+  }, [firstVisibleIdx, videosInfo, setCurrentTime]);
 
   // Initialize video refs array
   useEffect(() => {
     videoRefs.current = videoRefs.current.slice(0, videosInfo.length);
   }, [videosInfo.length]);
 
-  // Track failed videos for UI display
   const [failedVideos, setFailedVideos] = React.useState<Set<string>>(new Set());
 
   // Handle videos ready
@@ -59,20 +92,20 @@ export const SimpleVideosPlayer = ({
     hasSignaledReadyRef.current = false;
     setVideosReady(false);
     let readyCount = 0;
-    const videoStatuses = new Map<number, 'pending' | 'ready' | 'failed'>();
+    const videoStatuses = new Map<number, "pending" | "ready" | "failed">();
 
-    const markVideoReady = (index: number, status: 'ready' | 'failed') => {
-      if (videoStatuses.get(index) !== 'pending') return; // Already processed
+    const markVideoReady = (index: number, status: "ready" | "failed") => {
+      if (videoStatuses.get(index) !== "pending") return;
       videoStatuses.set(index, status);
       readyCount++;
 
-      if (status === 'failed') {
+      if (status === "failed") {
         const info = videosInfo[index];
-        setFailedVideos(prev => new Set(prev).add(info.filename));
+        setFailedVideos((prev) => new Set(prev).add(info.filename));
       }
 
       const hasSuccessfulVideo = Array.from(videoStatuses.values()).some(
-        (s) => s === 'ready',
+        (s) => s === "ready",
       );
       const allProcessed = readyCount === videosInfo.length;
       const shouldSignalReady =
@@ -82,41 +115,33 @@ export const SimpleVideosPlayer = ({
         hasSignaledReadyRef.current = true;
         setVideosReady(true);
         onVideosReady();
-        // Auto-play only if at least one video loaded successfully
         if (hasSuccessfulVideo) setIsPlaying(true);
       }
     };
 
-    // Timeout to detect videos that never load (private dataset auth failure)
-    // Increased to 120 seconds because HuggingFace can be slow for first loads
-    const VIDEO_LOAD_TIMEOUT = 120000; // 120 seconds
+    const VIDEO_LOAD_TIMEOUT = 120000;
     const timeoutIds: NodeJS.Timeout[] = [];
 
     videoRefs.current.forEach((video, index) => {
       if (video) {
         const info = videosInfo[index];
-        videoStatuses.set(index, 'pending');
+        videoStatuses.set(index, "pending");
 
-        // Timeout handler for videos that never load (auth failure on private datasets)
-        // Only mark as failed if there's truly no network activity (networkState === 3 means error)
         const timeoutId = setTimeout(() => {
-          if (videoStatuses.get(index) === 'pending') {
-            // If video is actively loading (networkState=2) or has data (readyState>0), don't fail it
+          if (videoStatuses.get(index) === "pending") {
             if (video.networkState === 2 || video.readyState > 0) {
-              return; // Don't mark as failed, video is still loading
+              return;
             }
-            markVideoReady(index, 'failed');
+            markVideoReady(index, "failed");
           }
         }, VIDEO_LOAD_TIMEOUT);
         timeoutIds.push(timeoutId);
 
-        // Error handler for videos
         const handleError = () => {
-          markVideoReady(index, 'failed');
+          markVideoReady(index, "failed");
         };
-        video.addEventListener('error', handleError);
+        video.addEventListener("error", handleError);
 
-        // Setup segment boundaries
         if (info.isSegmented) {
           const handleTimeUpdate = () => {
             const segmentEnd = info.segmentEnd || video.duration;
@@ -124,7 +149,6 @@ export const SimpleVideosPlayer = ({
 
             if (video.currentTime >= segmentEnd - 0.05) {
               video.currentTime = segmentStart;
-              // Also update the global time to reset to start
               if (index === firstVisibleIdx) {
                 setCurrentTime(0);
               }
@@ -133,26 +157,23 @@ export const SimpleVideosPlayer = ({
 
           const handleLoadedData = () => {
             video.currentTime = info.segmentStart || 0;
-            markVideoReady(index, 'ready');
+            markVideoReady(index, "ready");
           };
 
-          video.addEventListener('timeupdate', handleTimeUpdate);
-          video.addEventListener('loadeddata', handleLoadedData);
+          video.addEventListener("timeupdate", handleTimeUpdate);
+          video.addEventListener("loadeddata", handleLoadedData);
 
-          // Check if video already has enough data (event might have fired before we attached)
           if (video.readyState >= 1) {
             video.currentTime = info.segmentStart || 0;
-            markVideoReady(index, 'ready');
+            markVideoReady(index, "ready");
           }
 
-          // Store cleanup
           (video as any)._segmentHandlers = () => {
-            video.removeEventListener('timeupdate', handleTimeUpdate);
-            video.removeEventListener('loadeddata', handleLoadedData);
-            video.removeEventListener('error', handleError);
+            video.removeEventListener("timeupdate", handleTimeUpdate);
+            video.removeEventListener("loadeddata", handleLoadedData);
+            video.removeEventListener("error", handleError);
           };
         } else {
-          // For non-segmented videos, handle end of video
           const handleEnded = () => {
             video.currentTime = 0;
             if (index === firstVisibleIdx) {
@@ -161,29 +182,28 @@ export const SimpleVideosPlayer = ({
           };
 
           const handleCanPlayThrough = () => {
-            markVideoReady(index, 'ready');
+            markVideoReady(index, "ready");
           };
 
-          video.addEventListener('ended', handleEnded);
-          video.addEventListener('canplaythrough', handleCanPlayThrough, { once: true });
+          video.addEventListener("ended", handleEnded);
+          video.addEventListener("canplaythrough", handleCanPlayThrough, {
+            once: true,
+          });
 
-          // Check if video already has enough data (event might have fired before we attached)
           if (video.readyState >= 4) {
-            markVideoReady(index, 'ready');
+            markVideoReady(index, "ready");
           }
 
-          // Store cleanup
           (video as any)._segmentHandlers = () => {
-            video.removeEventListener('ended', handleEnded);
-            video.removeEventListener('error', handleError);
+            video.removeEventListener("ended", handleEnded);
+            video.removeEventListener("error", handleError);
           };
         }
       }
     });
 
     return () => {
-      // Clear all timeouts
-      timeoutIds.forEach(id => clearTimeout(id));
+      timeoutIds.forEach((id) => clearTimeout(id));
       videoRefs.current.forEach((video) => {
         if (video && (video as any)._segmentHandlers) {
           (video as any)._segmentHandlers();
@@ -192,9 +212,45 @@ export const SimpleVideosPlayer = ({
     };
   }, [videosInfo, onVideosReady, setIsPlaying, firstVisibleIdx, setCurrentTime]);
 
-  // Handle play/pause
+  // Throttled clock from master video while playing (avoid setCurrentTime on every timeupdate)
   useEffect(() => {
-    if (!videosReady) return;
+    if (!videosReady || firstVisibleIdx < 0) return;
+    const video = videoRefs.current[firstVisibleIdx];
+    const info = videosInfo[firstVisibleIdx];
+    if (!video || !info) return;
+
+    if (!isPlaying) {
+      flushMasterTimeToContext();
+      return;
+    }
+
+    let rafId = 0;
+    let lastEmit = 0;
+
+    const tick = (now: number) => {
+      if (!video.paused) {
+        if (now - lastEmit >= CLOCK_EMIT_MS) {
+          lastEmit = now;
+          setCurrentTime(globalTimeFromVideo(video, info));
+        }
+      }
+      rafId = requestAnimationFrame(tick);
+    };
+
+    rafId = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(rafId);
+  }, [
+    isPlaying,
+    videosReady,
+    firstVisibleIdx,
+    videosInfo,
+    setCurrentTime,
+    flushMasterTimeToContext,
+  ]);
+
+  // Play/pause + playbackRate (overlay effect may pause briefly for speed-up)
+  useEffect(() => {
+    if (!videosReady || speedBuffering) return;
 
     videoRefs.current.forEach((video, idx) => {
       if (!video) return;
@@ -207,20 +263,33 @@ export const SimpleVideosPlayer = ({
         return;
       }
 
-      video.play().catch(e => {
-        if (e.name !== 'AbortError') {
+      video.play().catch((e) => {
+        if (e.name !== "AbortError") {
           console.error("Error playing video");
         }
       });
     });
-  }, [isPlaying, playbackSpeed, videosReady, hiddenVideos, videosInfo]);
+  }, [
+    isPlaying,
+    playbackSpeed,
+    videosReady,
+    hiddenVideos,
+    videosInfo,
+    speedBuffering,
+  ]);
 
-  // Sync video times
+  // Sync non-master videos / apply explicit seeks from context (drift correction)
   useEffect(() => {
     if (!videosReady) return;
 
+    const fastPlaying = isPlaying && playbackSpeed > 1;
+    const driftThreshold = fastPlaying ? 1.0 : 0.2;
+
     videoRefs.current.forEach((video, index) => {
       if (video && !hiddenVideos.includes(videosInfo[index].filename)) {
+        if (index === firstVisibleIdx && isPlaying) {
+          return;
+        }
         const info = videosInfo[index];
         let targetTime = currentTime;
 
@@ -229,35 +298,113 @@ export const SimpleVideosPlayer = ({
         }
 
         const drift = Math.abs(video.currentTime - targetTime);
-        if (drift > 0.2) {
+        if (drift > driftThreshold) {
           video.currentTime = targetTime;
         }
       }
     });
-  }, [currentTime, videosInfo, videosReady, hiddenVideos]);
+  }, [
+    currentTime,
+    videosInfo,
+    videosReady,
+    hiddenVideos,
+    isPlaying,
+    playbackSpeed,
+    firstVisibleIdx,
+  ]);
 
-  // Handle time update from first visible video
-  const handleTimeUpdate = (e: React.SyntheticEvent<HTMLVideoElement>) => {
-    const video = e.target as HTMLVideoElement;
-    const videoIndex = videoRefs.current.findIndex(ref => ref === video);
-    const info = videosInfo[videoIndex];
-
-    if (info) {
-      let globalTime = video.currentTime;
-      if (info.isSegmented) {
-        globalTime = video.currentTime - (info.segmentStart || 0);
-      }
-      setCurrentTime(globalTime);
+  // Speed-up: brief buffer gate + overlay when increasing rate above 1× while playing
+  useEffect(() => {
+    if (!videosReady || firstVisibleIdx < 0) {
+      prevPlaybackSpeedRef.current = playbackSpeed;
+      return;
     }
-  };
+    if (!isPlaying) {
+      prevPlaybackSpeedRef.current = playbackSpeed;
+      return;
+    }
 
-  // Handle play click for segmented videos
+    const prev = prevPlaybackSpeedRef.current;
+    const increased = playbackSpeed > prev && playbackSpeed > 1;
+    prevPlaybackSpeedRef.current = playbackSpeed;
+    if (!increased) return;
+
+    const master = videoRefs.current[firstVisibleIdx];
+    if (!master) return;
+
+    speedUpAbortRef.current?.abort();
+    const ac = new AbortController();
+    speedUpAbortRef.current = ac;
+
+    const run = async () => {
+      const wasPlaying = isPlaying;
+      setSpeedBuffering(true);
+      master.playbackRate = playbackSpeed;
+      videoRefs.current.forEach((v, idx) => {
+        if (!v || hiddenVideos.includes(videosInfo[idx].filename)) return;
+        v.playbackRate = playbackSpeed;
+        v.pause();
+      });
+
+      const needAhead = SPEED_UP_BUFFER_AHEAD_SEC / Math.max(1, playbackSpeed);
+      const deadline = Date.now() + SPEED_UP_WAIT_MS;
+
+      try {
+        await new Promise<void>((resolve) => {
+          const check = () => {
+            if (ac.signal.aborted) {
+              resolve();
+              return;
+            }
+            if (
+              bufferedAheadSeconds(master) >= needAhead ||
+              Date.now() >= deadline
+            ) {
+              resolve();
+              return;
+            }
+            requestAnimationFrame(check);
+          };
+          master.addEventListener("progress", check, { signal: ac.signal });
+          master.addEventListener("canplay", check, { signal: ac.signal });
+          check();
+        });
+      } finally {
+        ac.abort();
+      }
+
+      setSpeedBuffering(false);
+      if (wasPlaying) {
+        videoRefs.current.forEach((v, idx) => {
+          if (!v || hiddenVideos.includes(videosInfo[idx].filename)) return;
+          v.play().catch(() => {});
+        });
+      }
+    };
+
+    void run();
+    return () => {
+      ac.abort();
+      setSpeedBuffering(false);
+    };
+  }, [
+    playbackSpeed,
+    videosReady,
+    firstVisibleIdx,
+    hiddenVideos,
+    videosInfo,
+    isPlaying,
+  ]);
+
   const handlePlay = (video: HTMLVideoElement, info: VideoInfo) => {
     if (info.isSegmented) {
       const segmentStart = info.segmentStart || 0;
       const segmentEnd = info.segmentEnd || video.duration;
 
-      if (video.currentTime < segmentStart || video.currentTime >= segmentEnd) {
+      if (
+        video.currentTime < segmentStart ||
+        video.currentTime >= segmentEnd
+      ) {
         video.currentTime = segmentStart;
       }
     }
@@ -266,7 +413,19 @@ export const SimpleVideosPlayer = ({
 
   return (
     <>
-      {/* Hidden videos menu */}
+      {speedBuffering && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50 pointer-events-auto">
+          <div className="rounded-xl border border-slate-500 bg-slate-900 px-8 py-6 text-center shadow-xl">
+            <p className="text-slate-100 font-medium">
+              Ajustando velocidad ({playbackSpeed}×)…
+            </p>
+            <p className="mt-2 text-xs text-slate-400">
+              Preparando buffer de vídeo
+            </p>
+          </div>
+        </div>
+      )}
+
       {hiddenVideos.length > 0 && (
         <div className="relative mb-4">
           <button
@@ -284,7 +443,9 @@ export const SimpleVideosPlayer = ({
                 <button
                   key={filename}
                   className="block w-full text-left px-2 py-1 rounded hover:bg-slate-700 text-slate-100"
-                  onClick={() => setHiddenVideos(prev => prev.filter(v => v !== filename))}
+                  onClick={() =>
+                    setHiddenVideos((prev) => prev.filter((v) => v !== filename))
+                  }
                 >
                   {filename}
                 </button>
@@ -294,21 +455,20 @@ export const SimpleVideosPlayer = ({
         </div>
       )}
 
-      {/* Videos */}
       <div className="flex flex-wrap gap-x-2 gap-y-6">
         {videosInfo.map((info, idx) => {
           if (hiddenVideos.includes(info.filename)) return null;
 
           const isEnlarged = enlargedVideo === info.filename;
-          const isFirstVisible = idx === firstVisibleIdx;
 
           return (
             <div
               key={info.filename}
-              className={`${isEnlarged
-                ? "z-40 fixed inset-0 bg-black bg-opacity-90 flex flex-col items-center justify-center"
-                : "max-w-96"
-                }`}
+              className={`${
+                isEnlarged
+                  ? "z-40 fixed inset-0 bg-black bg-opacity-90 flex flex-col items-center justify-center"
+                  : "max-w-96"
+              }`}
             >
               <p className="truncate w-full rounded-t-xl bg-gray-800 px-2 text-sm text-gray-300 flex items-center justify-between">
                 <span>{info.filename}</span>
@@ -316,38 +476,66 @@ export const SimpleVideosPlayer = ({
                   <button
                     title={isEnlarged ? "Minimize" : "Enlarge"}
                     className="ml-2 p-1 hover:bg-slate-700 rounded"
-                    onClick={() => setEnlargedVideo(isEnlarged ? null : info.filename)}
+                    onClick={() =>
+                      setEnlargedVideo(isEnlarged ? null : info.filename)
+                    }
                   >
                     {isEnlarged ? <FaCompress /> : <FaExpand />}
                   </button>
                   <button
                     title="Hide Video"
                     className="ml-1 p-1 hover:bg-slate-700 rounded"
-                    onClick={() => setHiddenVideos(prev => [...prev, info.filename])}
-                    disabled={videosInfo.filter(v => !hiddenVideos.includes(v.filename)).length === 1}
+                    onClick={() =>
+                      setHiddenVideos((prev) => [...prev, info.filename])
+                    }
+                    disabled={
+                      videosInfo.filter((v) => !hiddenVideos.includes(v.filename))
+                        .length === 1
+                    }
                   >
                     <FaTimes />
                   </button>
                 </span>
               </p>
               {failedVideos.has(info.filename) ? (
-                <div className={`w-full flex flex-col items-center justify-center bg-slate-800 text-slate-300 p-4 ${isEnlarged ? "max-h-[90vh] max-w-[90vw] min-h-[300px]" : "min-h-[200px]"}`}>
-                  <svg className="w-12 h-12 mb-2 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                <div
+                  className={`w-full flex flex-col items-center justify-center bg-slate-800 text-slate-300 p-4 ${
+                    isEnlarged
+                      ? "max-h-[90vh] max-w-[90vw] min-h-[300px]"
+                      : "min-h-[200px]"
+                  }`}
+                >
+                  <svg
+                    className="w-12 h-12 mb-2 text-slate-500"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"
+                    />
                   </svg>
                   <p className="text-sm font-medium mb-1">Video unavailable</p>
-                  <p className="text-xs text-slate-400 text-center">This video requires authentication.<br />Private dataset videos cannot be displayed in the browser.</p>
+                  <p className="text-xs text-slate-400 text-center">
+                    This video requires authentication.
+                    <br />
+                    Private dataset videos cannot be displayed in the browser.
+                  </p>
                 </div>
               ) : (
                 <video
                   ref={(el) => {
                     videoRefs.current[idx] = el;
                   }}
-                  className={`w-full object-contain ${isEnlarged ? "max-h-[90vh] max-w-[90vw]" : ""}`}
+                  className={`w-full object-contain ${
+                    isEnlarged ? "max-h-[90vh] max-w-[90vw]" : ""
+                  }`}
                   muted
                   preload="auto"
                   onPlay={(e) => handlePlay(e.currentTarget, info)}
-                  onTimeUpdate={isFirstVisible ? handleTimeUpdate : undefined}
                 >
                   <source src={getProxiedVideoUrl(info.url)} type="video/mp4" />
                   Your browser does not support the video tag.

@@ -3,6 +3,7 @@
  */
 
 import { getDatasetHostingConfig } from "@/utils/datasetEnv";
+import { parseJsonResponse } from "@/utils/jsonResponse";
 
 function datasetBaseUrl(): string {
   return getDatasetHostingConfig().baseUrl;
@@ -92,7 +93,7 @@ export async function getDatasetInfo(repoId: string): Promise<DatasetInfo> {
       throw new Error(`Failed to fetch dataset info: ${response.status}`);
     }
 
-    const data = await response.json();
+    const data = await parseJsonResponse<DatasetInfo>(response);
     
     // Check if it has the required structure
     if (!data.features) {

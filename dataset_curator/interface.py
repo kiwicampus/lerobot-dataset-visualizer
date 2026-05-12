@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sys
 
+from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QIntValidator
 from PyQt6.QtWidgets import (
     QApplication,
@@ -22,7 +23,12 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from dataset_curator.bridge import DEFAULT_BRIDGE_PORT, CuratorBridge, run_bridge_server
+from dataset_curator.bridge import (
+    DEFAULT_BRIDGE_PORT,
+    CuratorBridge,
+    run_bridge_server,
+    curator_debug,
+)
 from dataset_curator.data import append_curation_row
 
 
@@ -39,9 +45,13 @@ class DatasetCuratorWindow(QWidget):
         self._bridge = bridge
         self.setWindowTitle("Dataset curator")
         self._last_language_instruction = ""
-        self._bridge.episode_from_viz.connect(self._apply_episode_from_viz)
+        self._bridge.episode_from_viz.connect(
+            self._apply_episode_from_viz,
+            Qt.ConnectionType.QueuedConnection,
+        )
         self._bridge.language_instruction_from_viz.connect(
-            self._apply_language_instruction_from_viz
+            self._apply_language_instruction_from_viz,
+            Qt.ConnectionType.QueuedConnection,
         )
 
         self._episode_edit = QLineEdit()
@@ -114,12 +124,14 @@ class DatasetCuratorWindow(QWidget):
         root.addLayout(row)
 
     def _apply_episode_from_viz(self, episode_id: int) -> None:
+        curator_debug(f"UI slot _apply_episode_from_viz episode_id={episode_id}")
         self._episode_edit.blockSignals(True)
         self._episode_edit.setText(str(episode_id))
         self._episode_edit.blockSignals(False)
         self._on_inputs_changed()
 
     def _apply_language_instruction_from_viz(self, text: str) -> None:
+        curator_debug(f"UI slot _apply_language_instruction_from_viz len={len(text)}")
         self._last_language_instruction = text
         if self._btn_change.isChecked():
             self._prompt_edit.blockSignals(True)
@@ -230,6 +242,7 @@ class DatasetCuratorWindow(QWidget):
 def run_app() -> None:
     app = QApplication(sys.argv)
     port = int(os.environ.get("CURATOR_BRIDGE_PORT", str(DEFAULT_BRIDGE_PORT)))
+    curator_debug(f"Starting curator; bridge port={port} CURATOR_BRIDGE_DEBUG={os.environ.get('CURATOR_BRIDGE_DEBUG', '1')}")
     bridge = CuratorBridge()
     server = run_bridge_server(bridge, port)
     w = DatasetCuratorWindow(bridge)

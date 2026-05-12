@@ -96,7 +96,7 @@ export async function getAdjacentEpisodesVideoInfo(
             episodeMetadata,
           );
         } else {
-          const episode_chunk = Math.floor(0 / 1000);
+          const episode_chunk = Math.floor(episodeId / 1000);
           videosInfo = Object.entries(info.features)
             .filter(([, value]) => value.dtype === "video")
             .map(([key]) => {
@@ -262,9 +262,17 @@ async function getEpisodeDataV2(
         const tasksText = await tasksResponse.text();
         // Parse JSONL format (one JSON object per line)
         const tasksData = tasksText
-          .split('\n')
-          .filter(line => line.trim())
-          .map(line => JSON.parse(line));
+          .split("\n")
+          .map((line) => line.trim())
+          .filter(Boolean)
+          .map((line) => {
+            try {
+              return JSON.parse(line) as Record<string, unknown>;
+            } catch {
+              return null;
+            }
+          })
+          .filter((row): row is Record<string, unknown> => row !== null);
         
         if (tasksData && tasksData.length > 0) {
           const taskIndex = allData[0].task_index;
@@ -273,9 +281,11 @@ async function getEpisodeDataV2(
           const taskIndexNum = typeof taskIndex === 'bigint' ? Number(taskIndex) : taskIndex;
           
           // Find task by task_index
-          const taskData = tasksData.find(t => t.task_index === taskIndexNum);
-          if (taskData) {
-            task = taskData.task;
+          const taskData = tasksData.find(
+            (t) => t.task_index === taskIndexNum,
+          );
+          if (taskData != null && "task" in taskData && taskData.task != null) {
+            task = String(taskData.task);
           }
         }
       }
