@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 import sys
+import urllib.error
+import urllib.request
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QIntValidator
@@ -65,6 +67,7 @@ class DatasetCuratorWindow(QWidget):
         self._btn_keep = QPushButton(self.ACTION_KEEP)
         for b in (self._btn_delete, self._btn_change, self._btn_keep):
             b.setCheckable(True)
+            b.toggled.connect(self._on_inputs_changed)
 
         self._action_group = QButtonGroup(self)
         self._action_group.setExclusive(True)
@@ -107,10 +110,18 @@ class DatasetCuratorWindow(QWidget):
 
         self._save_btn = QPushButton("Save")
         self._save_btn.clicked.connect(self._on_save)
-        self._save_btn.hide()
+        self._save_btn.setEnabled(False)
+
+        self._reload_viz_btn = QPushButton("Sync from visualizer")
+        self._reload_viz_btn.setToolTip(
+            "Ask the browser to send the current episode and instruction again "
+            "(use after reopening the curator).",
+        )
+        self._reload_viz_btn.clicked.connect(self._on_sync_from_visualizer)
 
         form = QFormLayout()
         form.addRow(QLabel("Episode index"), self._episode_edit)
+        form.addRow(self._reload_viz_btn)
         form.addRow(QLabel("Action"), action_row)
         form.addRow(self._delete_box)
         form.addRow(self._prompt_row)
@@ -201,9 +212,11 @@ class DatasetCuratorWindow(QWidget):
 
     def _on_inputs_changed(self) -> None:
         idx_ok = self._episode_index_value() is not None
+        action_chosen = self._selected_action() is not None
         detail = self._detail_for_save()
-        show_save = idx_ok and detail is not None
-        self._save_btn.setVisible(show_save)
+        # Save only when episode is set, user picked Keep/Delete/Change, and detail is complete.
+        can_save = idx_ok and action_chosen and detail is not None
+        self._save_btn.setEnabled(can_save)
 
     def _on_save(self) -> None:
         idx = self._episode_index_value()
@@ -236,7 +249,25 @@ class DatasetCuratorWindow(QWidget):
         self._prompt_edit.clear()
         self._prompt_row.hide()
         self._last_language_instruction = ""
-        self._save_btn.hide()
+        self._save_btn.setEnabled(False)
+
+    def _on_sync_from_visualizer(self) -> None:
+        port = int(os.environ.get("CURATOR_BRIDGE_PORT", str(DEFAULT_BRIDGE_PORT)))
+        url = f"http://127.0.0.1:{port}/request-resync"
+        try:
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if resp.status not in (200, 204):
+                    raise OSError(f"HTTP {resp.status}")
+        except (OSError, urllib.error.URLError) as e:
+            QMessageBox.warning(
+                self,
+                "Sync from visualizer failed",
+                f"The browser should poll the bridge within a few hundred ms.\n"
+                f"If this persists, ensure the visualizer tab is open and the bridge URL matches.\n\n{e!s}",
+            )
+            return
+        curator_debug("UI requested resync from visualizer (GET /request-resync ok)")
 
 
 def run_app() -> None:

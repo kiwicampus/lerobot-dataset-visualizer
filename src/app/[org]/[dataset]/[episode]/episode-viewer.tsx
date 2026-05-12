@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { postParentMessageWithParams } from "@/utils/postParentMessage";
 import { SimpleVideosPlayer } from "@/components/simple-videos-player";
@@ -12,10 +12,15 @@ import Loading from "@/components/loading-component";
 import { getAdjacentEpisodesVideoInfo } from "./fetch-data";
 import {
   curatorBridgeLog,
-  pollCuratorAdvance,
+  pollCuratorBridge,
   syncEpisodeToCurator,
 } from "@/utils/curatorBridge";
 import { getProxiedVideoUrl } from "@/utils/videoProxy";
+import {
+  nextVisibleEpisodeAfter,
+  prevVisibleEpisodeBefore,
+  sortedVisibleEpisodeIds,
+} from "@/utils/episodeFilter";
 
 export default function EpisodeViewer({
   data,
@@ -39,15 +44,13 @@ export default function EpisodeViewer({
     );
   }
   return (
-    <TimeProvider duration={data.duration}>
+    <TimeProvider
+      key={`${org}/${dataset}/episode_${data.episodeId}`}
+      duration={data.duration}
+    >
       <EpisodeViewerInner data={data} org={org} dataset={dataset} />
     </TimeProvider>
   );
-}
-
-function indexInEpisodeList(episodes: unknown[], episodeId: unknown): number {
-  const cur = Number(episodeId);
-  return episodes.findIndex((e) => Number(e) === cur);
 }
 
 function EpisodeViewerInner({
@@ -68,10 +71,17 @@ function EpisodeViewerInner({
     task,
   } = data;
 
-  const episodesRef = useRef(episodes);
+  const sortedEpisodes = useMemo(
+    () => sortedVisibleEpisodeIds(episodes),
+    [episodes],
+  );
+
+  const episodesRef = useRef(sortedEpisodes);
   const episodeIdRef = useRef(episodeId);
-  episodesRef.current = episodes;
+  const taskRef = useRef("");
+  episodesRef.current = sortedEpisodes;
   episodeIdRef.current = episodeId;
+  taskRef.current = typeof task === "string" ? task : "";
 
   const [videosReady, setVideosReady] = useState(!videosInfo.length);
   const [chartsReady, setChartsReady] = useState(false);
@@ -99,8 +109,8 @@ function EpisodeViewerInner({
   // Pagination state
   const pageSize = 100;
   const [currentPage, setCurrentPage] = useState(1);
-  const totalPages = Math.ceil(episodes.length / pageSize);
-  const paginatedEpisodes = episodes.slice(
+  const totalPages = Math.ceil(sortedEpisodes.length / pageSize);
+  const paginatedEpisodes = sortedEpisodes.slice(
     (currentPage - 1) * pageSize,
     currentPage * pageSize,
   );
@@ -113,9 +123,9 @@ function EpisodeViewerInner({
     const preloadAdjacent = async () => {
       try {
         const adjacent = await getAdjacentEpisodesVideoInfo(org, dataset, episodeId, 2);
-        const currentIdx = indexInEpisodeList(episodes, episodeId);
+        const currentIdx = sortedEpisodes.indexOf(Number(episodeId));
         const urls = adjacent
-          .filter(({ episodeId: id }) => indexInEpisodeList(episodes, id) > currentIdx)
+          .filter(({ episodeId: id }) => sortedEpisodes.indexOf(Number(id)) > currentIdx)
           .flatMap(({ videosInfo: vInfo }) =>
             vInfo.map((v: any) => getProxiedVideoUrl(v.url))
           );
@@ -126,7 +136,7 @@ function EpisodeViewerInner({
     };
 
     preloadAdjacent();
-  }, [org, dataset, episodeId]);
+  }, [org, dataset, episodeId, sortedEpisodes]);
 
   // Initialize based on URL time parameter
   useEffect(() => {
@@ -156,41 +166,82 @@ function EpisodeViewerInner({
     syncEpisodeToCurator(id, typeof task === "string" ? task : "");
   }, [pathname, episodeId, task]);
 
-  // After curator Save, jump to next episode in dataset order. Serial polls (no overlapping
-  // setInterval + async) so one GET /poll consumes advance=true reliably; URL wins for "current".
+  // After curator Save, jump to next episode. Snapshot episode + episode list BEFORE await
+  // poll (refs can change during await). Next index from sorted visible list only — do not
+  // use server nextEpisodeId here (it can desync from RSC/ref timing and skip episodes).
   useEffect(() => {
     let cancelled = false;
-    let timeoutId: ReturnType<typeof setTimeout>;
+    let timeoutId: number | undefined;
 
     const schedule = () => {
       timeoutId = window.setTimeout(run, 350);
     };
 
+    function currentEpisodeFromBrowserPath(): number | null {
+      const m = window.location.pathname.match(/\/episode_(\d+)/);
+      if (!m) return null;
+      const n = Number(m[1]);
+      return Number.isFinite(n) ? n : null;
+    }
+
     async function run() {
       if (cancelled) return;
       try {
-        const go = await pollCuratorAdvance();
-        if (!go) return;
+        const epSnapBefore = Number(episodeIdRef.current);
+        const episodesSnap = episodesRef.current.slice();
 
-        const eps = episodesRef.current;
-        const fromUrl = pathname.match(/\/episode_(\d+)/);
-        const cur = fromUrl
-          ? Number(fromUrl[1])
-          : Number(episodeIdRef.current);
-        const idx = indexInEpisodeList(eps, cur);
+        const { advance, resync } = await pollCuratorBridge();
+        if (cancelled) return;
 
-        if (idx >= 0 && idx < eps.length - 1) {
-          const nextId = eps[idx + 1];
+        if (resync) {
+          const pathEp = currentEpisodeFromBrowserPath();
+          const id =
+            pathEp != null && Number.isFinite(pathEp)
+              ? pathEp
+              : Number(episodeIdRef.current);
+          if (Number.isFinite(id)) {
+            syncEpisodeToCurator(id, taskRef.current);
+          }
+        }
+
+        if (cancelled) return;
+
+        if (!advance) return;
+
+        if (!Number.isFinite(epSnapBefore)) return;
+
+        const curNow = Number(episodeIdRef.current);
+        if (curNow !== epSnapBefore) return;
+
+        const nextId = nextVisibleEpisodeAfter(epSnapBefore, episodesSnap);
+
+        if (nextId !== null) {
+          const pathEp = currentEpisodeFromBrowserPath();
+          if (pathEp != null && pathEp === nextId) {
+            curatorBridgeLog("advance → skip push, URL already at next episode", {
+              nextId,
+            });
+            return;
+          }
           const path =
             org && dataset
               ? `/${org}/${dataset}/episode_${nextId}`
               : `./episode_${nextId}`;
-          curatorBridgeLog("advance → router.push", { cur, nextId, idx, path });
+          curatorBridgeLog("advance → router.push", {
+            cur: epSnapBefore,
+            nextId,
+            path,
+            pathAtPoll: window.location.pathname,
+          });
           router.push(path);
         } else {
           console.warn(
             "[CuratorBridge:viz] advance=true but cannot go to next episode",
-            { cur, idx, episodesLen: eps?.length, pathname },
+            {
+              cur: epSnapBefore,
+              episodesLen: episodesSnap?.length,
+              pathname: window.location.pathname,
+            },
           );
         }
       } finally {
@@ -203,12 +254,12 @@ function EpisodeViewerInner({
       cancelled = true;
       window.clearTimeout(timeoutId);
     };
-  }, [router, org, dataset, pathname]);
+  }, [router, org, dataset]);
 
   // Initialize based on URL time parameter
   useEffect(() => {
     // Initialize page based on current episode
-    const episodeIndex = indexInEpisodeList(episodes, episodeId);
+    const episodeIndex = sortedEpisodes.indexOf(Number(episodeId));
     if (episodeIndex !== -1) {
       setCurrentPage(Math.floor(episodeIndex / pageSize) + 1);
     }
@@ -218,7 +269,7 @@ function EpisodeViewerInner({
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [episodes, episodeId, pageSize, searchParams, org, dataset, router]);
+  }, [sortedEpisodes, episodeId, pageSize, searchParams, org, dataset, router]);
 
   // Only update URL ?t= param when the integer second changes
   const lastUrlSecondRef = useRef<number>(-1);
@@ -250,11 +301,12 @@ function EpisodeViewerInner({
       setIsPlaying((prev: boolean) => !prev);
     } else if (key === "ArrowDown" || key === "ArrowUp") {
       e.preventDefault();
-      const idx = indexInEpisodeList(episodes, episodeId);
-      if (idx === -1) return;
-      const nextIdx = key === "ArrowDown" ? idx + 1 : idx - 1;
-      if (nextIdx >= 0 && nextIdx < episodes.length) {
-        const nextId = episodes[nextIdx];
+      const cur = Number(episodeId);
+      const nextId =
+        key === "ArrowDown"
+          ? nextVisibleEpisodeAfter(cur, sortedEpisodes)
+          : prevVisibleEpisodeBefore(cur, sortedEpisodes);
+      if (nextId !== null) {
         const path =
           org && dataset
             ? `/${org}/${dataset}/episode_${nextId}`

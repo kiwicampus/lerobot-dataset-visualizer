@@ -471,7 +471,7 @@ async function getEpisodeDataV3(
   // Calculate duration from episode length and FPS if available
   const duration = episodeMetadata.length ? episodeMetadata.length / info.fps : 
                    (episodeMetadata.video_to_timestamp - episodeMetadata.video_from_timestamp);
-  
+
   return {
     datasetInfo,
     episodeId,

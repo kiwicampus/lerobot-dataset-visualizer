@@ -23,11 +23,22 @@ export function getCuratorBridgeBase(): string {
 }
 
 /** Push episode id and language instruction (task) for the curator UI. */
+let _lastSyncKey = "";
+let _lastSyncAt = 0;
+
 export function syncEpisodeToCurator(
   episodeId: number,
   languageInstruction: string = "",
 ): void {
   if (typeof window === "undefined") return;
+  const key = `${episodeId}\0${languageInstruction}`;
+  const now = Date.now();
+  if (key === _lastSyncKey && now - _lastSyncAt < 500) {
+    vizDebug("syncEpisodeToCurator → skip duplicate within 500ms", episodeId);
+    return;
+  }
+  _lastSyncKey = key;
+  _lastSyncAt = now;
   const base = getCuratorBridgeBase();
   const url = `${base}/sync`;
   const body = JSON.stringify({ episodeId, languageInstruction });
@@ -55,26 +66,34 @@ export function syncEpisodeToCurator(
     });
 }
 
-/** Returns true once after the user saves a row in the curator (advances visualizer). */
-export async function pollCuratorAdvance(): Promise<boolean> {
+/** Poll bridge: curator Save → advance; curator "Sync from visualizer" → resync. */
+export async function pollCuratorBridge(): Promise<{
+  advance: boolean;
+  resync: boolean;
+}> {
   const base = getCuratorBridgeBase();
   try {
     const r = await fetch(`${base}/poll`, { cache: "no-store", mode: "cors" });
-    if (!r.ok) return false;
+    if (!r.ok) return { advance: false, resync: false };
     const text = await r.text();
-    if (!text.trim()) return false;
-    let j: { advance?: boolean };
+    if (!text.trim()) return { advance: false, resync: false };
+    let j: { advance?: boolean; resync?: boolean };
     try {
-      j = JSON.parse(text) as { advance?: boolean };
+      j = JSON.parse(text) as { advance?: boolean; resync?: boolean };
     } catch {
-      return false;
+      return { advance: false, resync: false };
     }
     const advance = Boolean(j.advance);
-    if (advance) {
-      vizDebug("poll → advance=true");
-    }
-    return advance;
+    const resync = Boolean(j.resync);
+    if (advance) vizDebug("poll → advance=true");
+    if (resync) vizDebug("poll → resync=true");
+    return { advance, resync };
   } catch {
-    return false;
+    return { advance: false, resync: false };
   }
+}
+
+/** Returns true once after the user saves a row in the curator (advances visualizer). */
+export async function pollCuratorAdvance(): Promise<boolean> {
+  return (await pollCuratorBridge()).advance;
 }

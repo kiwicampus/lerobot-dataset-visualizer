@@ -40,6 +40,7 @@ class CuratorBridge(QObject):
         super().__init__()
         self._lock = threading.Lock()
         self._advance_pending = False
+        self._resync_from_viz_pending = False
         self._sync_queue: Queue = Queue()
         # HTTP workers run in background threads; QMetaObject.invokeMethod is flaky for slots in PyQt6.
         # Drain pending /sync payloads on the GUI thread every tick (bulletproof).
@@ -65,12 +66,21 @@ class CuratorBridge(QObject):
         with self._lock:
             self._advance_pending = True
 
-    def poll_advance(self) -> bool:
+    def request_resync_from_visualizer(self) -> None:
+        """Curator UI asks the browser to POST /sync again on next /poll (e.g. after reopen)."""
         with self._lock:
-            if self._advance_pending:
+            self._resync_from_viz_pending = True
+
+    def poll_advance_and_resync(self) -> tuple[bool, bool]:
+        """One-shot read for advance (after Save) and resync (after Reload from visualizer)."""
+        with self._lock:
+            advance = self._advance_pending
+            if advance:
                 self._advance_pending = False
-                return True
-            return False
+            resync = self._resync_from_viz_pending
+            if resync:
+                self._resync_from_viz_pending = False
+            return advance, resync
 
 
 def _enqueue_sync(bridge: CuratorBridge, episode_id: int, instruction_str: str) -> None:
@@ -132,13 +142,24 @@ def run_bridge_server(
             self.end_headers()
 
         def do_GET(self) -> None:
+            if self.path == "/request-resync" or self.path.startswith(
+                "/request-resync?"
+            ):
+                bridge_ref.request_resync_from_visualizer()
+                _dbg("HTTP GET /request-resync → pending re-push from visualizer on next /poll")
+                self.send_response(204)
+                _send_cors(self)
+                self.end_headers()
+                return
             if self.path != "/poll" and not self.path.startswith("/poll?"):
                 self.send_error(404)
                 return
-            advance = bridge_ref.poll_advance()
+            advance, resync = bridge_ref.poll_advance_and_resync()
             if advance:
                 _dbg("HTTP GET /poll → advance=True")
-            payload = json.dumps({"advance": advance}).encode("utf-8")
+            if resync:
+                _dbg("HTTP GET /poll → resync=True")
+            payload = json.dumps({"advance": advance, "resync": resync}).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             _send_cors(self)
@@ -149,5 +170,5 @@ def run_bridge_server(
     server = ThreadingHTTPServer((host, port), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    _dbg(f"HTTP server listening on http://{host}:{port} (sync POST /sync poll GET /poll)")
+    _dbg(f"HTTP server listening on http://{host}:{port} (sync POST /sync poll GET /poll request-resync GET /request-resync)")
     return server

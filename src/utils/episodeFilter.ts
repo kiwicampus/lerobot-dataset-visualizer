@@ -92,3 +92,38 @@ export function buildVisibleEpisodesList(totalEpisodes: number): number[] {
 
   return Array.from({ length: totalEpisodes }, (_, i) => i);
 }
+
+/** Dedupe + numeric sort. Navigation must not rely on raw array order (RSC/JSON can reorder). */
+export function sortedVisibleEpisodeIds(
+  visibleEpisodes: readonly unknown[],
+): number[] {
+  return [
+    ...new Set(
+      visibleEpisodes
+        .map((e) => Number(e))
+        .filter((n) => Number.isFinite(n)),
+    ),
+  ].sort((a, b) => a - b);
+}
+
+/** Next episode index in visible order (sorted), or null if none / not in list. */
+export function nextVisibleEpisodeAfter(
+  currentEpisodeId: number,
+  visibleEpisodes: readonly unknown[],
+): number | null {
+  const sorted = sortedVisibleEpisodeIds(visibleEpisodes);
+  const i = sorted.indexOf(currentEpisodeId);
+  if (i < 0 || i >= sorted.length - 1) return null;
+  return sorted[i + 1]!;
+}
+
+/** Previous episode index in visible order (sorted), or null. */
+export function prevVisibleEpisodeBefore(
+  currentEpisodeId: number,
+  visibleEpisodes: readonly unknown[],
+): number | null {
+  const sorted = sortedVisibleEpisodeIds(visibleEpisodes);
+  const i = sorted.indexOf(currentEpisodeId);
+  if (i <= 0) return null;
+  return sorted[i - 1]!;
+}
