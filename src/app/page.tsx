@@ -2,6 +2,7 @@ import { redirect } from "next/navigation";
 import HomeClient from "./home-client";
 import { getDatasetHostingConfig } from "@/utils/datasetEnv";
 import { initialEpisodeIndexFromEnv } from "@/utils/episodeFilter";
+import { getResumeEpisodeIndex } from "@/utils/curationResume";
 
 type HomeSearchParams = {
   path?: string | string[];
@@ -47,7 +48,7 @@ export default async function Home({
     getDatasetHostingConfig().defaultRepoId;
 
   if (repo) {
-    const episodeN = initialEpisodeIndexFromEnv();
+    const episodeN = getResumeEpisodeIndex() ?? initialEpisodeIndexFromEnv();
     redirect(`/${repo.replace(/^\//, "")}/episode_${episodeN}`);
   }
 

@@ -41,6 +41,7 @@ class CuratorBridge(QObject):
         self._lock = threading.Lock()
         self._advance_pending = False
         self._resync_from_viz_pending = False
+        self._navigate_to_pending: int | None = None
         self._sync_queue: Queue = Queue()
         # HTTP workers run in background threads; QMetaObject.invokeMethod is flaky for slots in PyQt6.
         # Drain pending /sync payloads on the GUI thread every tick (bulletproof).
@@ -71,8 +72,13 @@ class CuratorBridge(QObject):
         with self._lock:
             self._resync_from_viz_pending = True
 
-    def poll_advance_and_resync(self) -> tuple[bool, bool]:
-        """One-shot read for advance (after Save) and resync (after Reload from visualizer)."""
+    def request_navigate_to(self, episode_id: int) -> None:
+        """Tell the visualizer to navigate to a specific episode on the next /poll."""
+        with self._lock:
+            self._navigate_to_pending = episode_id
+
+    def poll_advance_and_resync(self) -> tuple[bool, bool, int | None]:
+        """One-shot read for advance, resync, and navigateTo flags."""
         with self._lock:
             advance = self._advance_pending
             if advance:
@@ -80,7 +86,9 @@ class CuratorBridge(QObject):
             resync = self._resync_from_viz_pending
             if resync:
                 self._resync_from_viz_pending = False
-            return advance, resync
+            navigate_to = self._navigate_to_pending
+            self._navigate_to_pending = None
+            return advance, resync, navigate_to
 
 
 def _enqueue_sync(bridge: CuratorBridge, episode_id: int, instruction_str: str) -> None:
@@ -154,12 +162,14 @@ def run_bridge_server(
             if self.path != "/poll" and not self.path.startswith("/poll?"):
                 self.send_error(404)
                 return
-            advance, resync = bridge_ref.poll_advance_and_resync()
+            advance, resync, navigate_to = bridge_ref.poll_advance_and_resync()
             if advance:
                 _dbg("HTTP GET /poll → advance=True")
             if resync:
                 _dbg("HTTP GET /poll → resync=True")
-            payload = json.dumps({"advance": advance, "resync": resync}).encode("utf-8")
+            if navigate_to is not None:
+                _dbg(f"HTTP GET /poll → navigateTo={navigate_to}")
+            payload = json.dumps({"advance": advance, "resync": resync, "navigateTo": navigate_to}).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             _send_cors(self)

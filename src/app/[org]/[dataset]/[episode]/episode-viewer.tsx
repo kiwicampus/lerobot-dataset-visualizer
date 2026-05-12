@@ -190,8 +190,18 @@ function EpisodeViewerInner({
         const epSnapBefore = Number(episodeIdRef.current);
         const episodesSnap = episodesRef.current.slice();
 
-        const { advance, resync } = await pollCuratorBridge();
+        const { advance, resync, navigateTo } = await pollCuratorBridge();
         if (cancelled) return;
+
+        if (navigateTo !== null && Number.isFinite(navigateTo)) {
+          const path =
+            org && dataset
+              ? `/${org}/${dataset}/episode_${navigateTo}`
+              : `./episode_${navigateTo}`;
+          curatorBridgeLog("navigateTo → router.push", { navigateTo, path });
+          router.push(path);
+          return;
+        }
 
         if (resync) {
           const pathEp = currentEpisodeFromBrowserPath();

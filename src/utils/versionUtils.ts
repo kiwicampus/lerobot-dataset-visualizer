@@ -70,46 +70,65 @@ interface DatasetInfo {
   features: Record<string, any>;
 }
 
+function isTransientNetworkError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const code = (err as any).cause?.code ?? (err as any).code ?? "";
+  // EAI_AGAIN = DNS temporary failure, ECONNRESET / ECONNREFUSED = TCP issues
+  return ["EAI_AGAIN", "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT"].includes(code)
+    || err.name === "AbortError";
+}
+
 /**
- * Fetches dataset information from the main revision
+ * Fetches dataset information from the main revision.
+ * Retries up to 3 times on transient network errors (DNS, TCP, timeout).
  */
 export async function getDatasetInfo(repoId: string): Promise<DatasetInfo> {
-  try {
-    const testUrl = `${datasetBaseUrl()}/${repoId}/resolve/main/meta/info.json`;
-    
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
-    
-    const response = await fetch(testUrl, { 
-      method: "GET",
-      cache: "no-store",
-      signal: controller.signal,
-      headers: getAuthHeaders()
-    });
-    
-    clearTimeout(timeoutId);
-    
-    if (!response.ok) {
-      throw new Error(`Failed to fetch dataset info: ${response.status}`);
-    }
+  const testUrl = `${datasetBaseUrl()}/${repoId}/resolve/main/meta/info.json`;
+  const MAX_ATTEMPTS = 3;
 
-    const data = await parseJsonResponse<DatasetInfo>(response);
-    
-    // Check if it has the required structure
-    if (!data.features) {
-      throw new Error("Dataset info.json does not have the expected features structure");
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 12000);
+
+      const response = await fetch(testUrl, {
+        method: "GET",
+        cache: "no-store",
+        signal: controller.signal,
+        headers: getAuthHeaders(),
+      });
+
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        throw new Error(`Failed to fetch dataset info: ${response.status}`);
+      }
+
+      const data = await parseJsonResponse<DatasetInfo>(response);
+
+      if (!data.features) {
+        throw new Error("Dataset info.json does not have the expected features structure");
+      }
+
+      return data as DatasetInfo;
+    } catch (error) {
+      lastError = error;
+      if (isTransientNetworkError(error) && attempt < MAX_ATTEMPTS) {
+        const delay = attempt * 1500; // 1.5s, 3s
+        console.warn(`[versionUtils] Transient network error (attempt ${attempt}/${MAX_ATTEMPTS}), retrying in ${delay}ms…`, (error as Error).message);
+        await new Promise((r) => setTimeout(r, delay));
+        continue;
+      }
+      break;
     }
-    
-    return data as DatasetInfo;
-  } catch (error) {
-    if (error instanceof Error) {
-      throw error;
-    }
-    throw new Error(
-      `Dataset ${repoId} is not compatible with this visualizer. ` +
-      "Failed to read dataset information from the main revision."
-    );
   }
+
+  if (lastError instanceof Error) throw lastError;
+  throw new Error(
+    `Dataset ${repoId} is not compatible with this visualizer. ` +
+    "Failed to read dataset information from the main revision."
+  );
 }
 
 

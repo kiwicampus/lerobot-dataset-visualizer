@@ -133,7 +133,7 @@ async function getEpisodeDataV2(
   episodeId: number,
   episodes: number[],
 ) {
-  const episode_chunk = Math.floor(0 / 1000);
+  const episode_chunk = Math.floor(episodeId / 1000);
 
   // Dataset information
   const datasetInfo = {
