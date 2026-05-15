@@ -5,10 +5,65 @@ import path from "path";
 import crypto from "crypto";
 import { Readable } from "stream";
 
+function isTransientNetworkError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const code = (err as any).cause?.code ?? (err as any).code ?? "";
+  return ["EAI_AGAIN", "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT"].includes(code)
+    || err.name === "AbortError";
+}
+
+async function fetchWithRetry(
+  url: string,
+  options: RequestInit,
+  maxAttempts: number,
+  delayMs: (attempt: number) => number,
+): Promise<Response> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fetch(url, options);
+    } catch (err) {
+      lastError = err;
+      if (isTransientNetworkError(err) && attempt < maxAttempts) {
+        const delay = delayMs(attempt);
+        console.warn(`[VideoProxy] Transient DNS error (attempt ${attempt}/${maxAttempts}), retrying in ${delay}ms…`);
+        await new Promise((r) => setTimeout(r, delay));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastError;
+}
+
 // Local disk cache — persists across requests in the local Next.js dev server process.
 const VIDEO_CACHE_DIR = path.join(os.tmpdir(), "lerobot-video-cache");
 const completedCache = new Map<string, string>();      // videoUrl → local file path
 const inProgressDownloads = new Set<string>();         // urls currently being downloaded
+
+// Limit concurrent background downloads to avoid saturating the DNS resolver.
+const MAX_CONCURRENT_DOWNLOADS = 1;
+const MAX_QUEUED_DOWNLOADS = 3; // drop requests beyond this — they'll be fetched live on demand
+let _activeDownloads = 0;
+const _downloadQueue: Array<() => void> = [];
+
+function acquireDownloadSlot(): Promise<void> | null {
+  if (_activeDownloads < MAX_CONCURRENT_DOWNLOADS) {
+    _activeDownloads++;
+    return Promise.resolve();
+  }
+  if (_downloadQueue.length >= MAX_QUEUED_DOWNLOADS) {
+    return null; // queue full — caller should skip this download
+  }
+  return new Promise((resolve) => {
+    _downloadQueue.push(resolve); // slot transfer: counter stays the same
+  });
+}
+
+function releaseDownloadSlot(): void {
+  const next = _downloadQueue.shift();
+  if (next) { next(); } else { _activeDownloads--; }
+}
 
 function getCachePath(videoUrl: string): string {
   const hash = crypto.createHash("md5").update(videoUrl).digest("hex");
@@ -40,12 +95,32 @@ function startBackgroundDownload(videoUrl: string, token: string): void {
   const tmpPath = filePath + ".tmp";
 
   (async () => {
+    // Wait before competing with the live range request and RSC page fetch
+    // that triggered this download — they share the same undici connection pool.
+    await new Promise((r) => setTimeout(r, 5000));
+
+    // Another request may have cached the file during the wait.
+    if (getLocalCachedFile(videoUrl)) {
+      inProgressDownloads.delete(videoUrl);
+      return;
+    }
+
+    const slot = acquireDownloadSlot();
+    if (slot === null) {
+      inProgressDownloads.delete(videoUrl);
+      console.log(`[VideoCache] Queue full, skipping background download for ${shortName}`);
+      return;
+    }
+    await slot;
     try {
       fs.mkdirSync(VIDEO_CACHE_DIR, { recursive: true });
-      console.log(`[VideoCache] Downloading ${shortName} …`);
-      const response = await fetch(videoUrl, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      console.log(`[VideoCache] Downloading ${shortName} … (slot ${_activeDownloads}/${MAX_CONCURRENT_DOWNLOADS})`);
+      const response = await fetchWithRetry(
+        videoUrl,
+        { headers: { Authorization: `Bearer ${token}` } },
+        4,
+        (attempt) => attempt * 1500, // 1.5s, 3s, 4.5s
+      );
       if (!response.ok || !response.body) {
         throw new Error(`HuggingFace returned ${response.status}`);
       }
@@ -71,6 +146,7 @@ function startBackgroundDownload(videoUrl: string, token: string): void {
       console.error(`[VideoCache] Download failed for ${shortName}:`, error);
       try { fs.unlinkSync(tmpPath); } catch { /* ignore */ }
     } finally {
+      releaseDownloadSlot();
       inProgressDownloads.delete(videoUrl);
     }
   })();
@@ -154,7 +230,12 @@ export async function GET(request: NextRequest) {
     const upstreamHeaders: HeadersInit = { Authorization: `Bearer ${token}` };
     if (rangeHeader) upstreamHeaders["Range"] = rangeHeader;
 
-    const response = await fetch(videoUrl, { headers: upstreamHeaders });
+    const response = await fetchWithRetry(
+      videoUrl,
+      { headers: upstreamHeaders },
+      5,
+      (attempt) => attempt * 800, // 800ms, 1.6s, 2.4s, 3.2s
+    );
 
     if (!response.ok) {
       return NextResponse.json(

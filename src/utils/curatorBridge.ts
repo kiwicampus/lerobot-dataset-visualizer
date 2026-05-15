@@ -66,30 +66,33 @@ export function syncEpisodeToCurator(
     });
 }
 
-/** Poll bridge: curator Save → advance; curator "Sync from visualizer" → resync. */
+/** Poll bridge: curator Save → advance; curator "Sync from visualizer" → resync; "Go to last saved" → navigateTo. */
 export async function pollCuratorBridge(): Promise<{
   advance: boolean;
   resync: boolean;
+  navigateTo: number | null;
 }> {
   const base = getCuratorBridgeBase();
   try {
     const r = await fetch(`${base}/poll`, { cache: "no-store", mode: "cors" });
-    if (!r.ok) return { advance: false, resync: false };
+    if (!r.ok) return { advance: false, resync: false, navigateTo: null };
     const text = await r.text();
-    if (!text.trim()) return { advance: false, resync: false };
-    let j: { advance?: boolean; resync?: boolean };
+    if (!text.trim()) return { advance: false, resync: false, navigateTo: null };
+    let j: { advance?: boolean; resync?: boolean; navigateTo?: number | null };
     try {
-      j = JSON.parse(text) as { advance?: boolean; resync?: boolean };
+      j = JSON.parse(text) as { advance?: boolean; resync?: boolean; navigateTo?: number | null };
     } catch {
-      return { advance: false, resync: false };
+      return { advance: false, resync: false, navigateTo: null };
     }
     const advance = Boolean(j.advance);
     const resync = Boolean(j.resync);
+    const navigateTo = typeof j.navigateTo === "number" ? j.navigateTo : null;
     if (advance) vizDebug("poll → advance=true");
     if (resync) vizDebug("poll → resync=true");
-    return { advance, resync };
+    if (navigateTo !== null) vizDebug("poll → navigateTo=", navigateTo);
+    return { advance, resync, navigateTo };
   } catch {
-    return { advance: false, resync: false };
+    return { advance: false, resync: false, navigateTo: null };
   }
 }
 

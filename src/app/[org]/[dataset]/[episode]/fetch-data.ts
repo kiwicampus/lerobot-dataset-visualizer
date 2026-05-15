@@ -12,6 +12,10 @@ import { buildVisibleEpisodesList } from "@/utils/episodeFilter";
 
 const SERIES_NAME_DELIMITER = " | ";
 
+// Cache parsed episodes parquet data — it doesn't change while the server is running.
+// Key = full parquet URL. Avoids re-fetching the same file on every episode navigation.
+const _episodesParquetCache = new Map<string, any[]>();
+
 export async function getEpisodeData(
   org: string,
   dataset: string,
@@ -73,8 +77,8 @@ export async function getAdjacentEpisodesVideoInfo(
       return [];
     }
 
-    for (let offset = -radius; offset <= radius; offset++) {
-      if (offset === 0) continue;
+    // Only fetch forward episodes — backward ones are filtered out in episode-viewer anyway
+    for (let offset = 1; offset <= radius; offset++) {
 
       const j = centerIdx + offset;
       if (j < 0 || j >= visible.length) continue;
@@ -972,33 +976,36 @@ async function loadEpisodeMetadataV3Simple(
     const episodesMetadataPath = `meta/episodes/chunk-${chunkIndex.toString().padStart(3, "0")}/file-${fileIndex.toString().padStart(3, "0")}.parquet`;
     const episodesMetadataUrl = buildVersionedUrl(repoId, version, episodesMetadataPath);
 
-    try {
-      const arrayBuffer = await fetchParquetFile(episodesMetadataUrl);
-      const episodesData = await readParquetAsObjects(arrayBuffer, []);
-      
-      if (episodesData.length === 0) {
-        // Empty file, try next one
-        fileIndex++;
-        continue;
-      }
-      
-      // Find the row for the requested episode by episode_index
-      for (const row of episodesData) {
-        const parsedRow = parseEpisodeRowSimple(row);
-        
-        if (parsedRow.episode_index === episodeId) {
-          episodeRow = row;
-          break;
+    let episodesData: any[];
+    if (_episodesParquetCache.has(episodesMetadataUrl)) {
+      episodesData = _episodesParquetCache.get(episodesMetadataUrl)!;
+    } else {
+      try {
+        const arrayBuffer = await fetchParquetFile(episodesMetadataUrl);
+        episodesData = await readParquetAsObjects(arrayBuffer, []);
+        if (episodesData.length > 0) {
+          _episodesParquetCache.set(episodesMetadataUrl, episodesData);
         }
+      } catch {
+        throw new Error(`Episode ${episodeId} not found in metadata (searched up to file-${fileIndex.toString().padStart(3, "0")}.parquet)`);
       }
-      
-      if (!episodeRow) {
-        // Not in this file, try the next one
-        fileIndex++;
+    }
+
+    if (episodesData.length === 0) {
+      fileIndex++;
+      continue;
+    }
+
+    for (const row of episodesData) {
+      const parsedRow = parseEpisodeRowSimple(row);
+      if (parsedRow.episode_index === episodeId) {
+        episodeRow = row;
+        break;
       }
-    } catch (error) {
-      // File doesn't exist - episode not found
-      throw new Error(`Episode ${episodeId} not found in metadata (searched up to file-${fileIndex.toString().padStart(3, "0")}.parquet)`);
+    }
+
+    if (!episodeRow) {
+      fileIndex++;
     }
   }
   

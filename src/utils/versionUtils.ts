@@ -78,19 +78,28 @@ function isTransientNetworkError(err: unknown): boolean {
     || err.name === "AbortError";
 }
 
+// info.json doesn't change while the server is running — cache it to avoid
+// a DNS lookup on every episode navigation.
+const _datasetInfoCache = new Map<string, DatasetInfo>();
+
 /**
  * Fetches dataset information from the main revision.
- * Retries up to 3 times on transient network errors (DNS, TCP, timeout).
+ * Result is cached in memory for the lifetime of the server process.
+ * Retries up to 5 times on transient network errors (DNS, TCP, timeout).
  */
 export async function getDatasetInfo(repoId: string): Promise<DatasetInfo> {
+  if (_datasetInfoCache.has(repoId)) {
+    return _datasetInfoCache.get(repoId)!;
+  }
+
   const testUrl = `${datasetBaseUrl()}/${repoId}/resolve/main/meta/info.json`;
-  const MAX_ATTEMPTS = 3;
+  const MAX_ATTEMPTS = 5;
 
   let lastError: unknown;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 12000);
+      const timeoutId = setTimeout(() => controller.abort(), 15000);
 
       const response = await fetch(testUrl, {
         method: "GET",
@@ -111,11 +120,12 @@ export async function getDatasetInfo(repoId: string): Promise<DatasetInfo> {
         throw new Error("Dataset info.json does not have the expected features structure");
       }
 
+      _datasetInfoCache.set(repoId, data as DatasetInfo);
       return data as DatasetInfo;
     } catch (error) {
       lastError = error;
       if (isTransientNetworkError(error) && attempt < MAX_ATTEMPTS) {
-        const delay = attempt * 1500; // 1.5s, 3s
+        const delay = attempt * 2000; // 2s, 4s, 6s, 8s
         console.warn(`[versionUtils] Transient network error (attempt ${attempt}/${MAX_ATTEMPTS}), retrying in ${delay}ms…`, (error as Error).message);
         await new Promise((r) => setTimeout(r, delay));
         continue;
