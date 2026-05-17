@@ -46,6 +46,10 @@ class DatasetCuratorWindow(QWidget):
     _PREV_ENTRY_STYLE = (
         "background-color: #7a2f2f; color: #ffcccc; border: 1px solid #cc5555;"
     )
+    # Style applied to the currently selected action button
+    _SELECTED_STYLE = (
+        "background-color: #5b9bd5; color: #ffffff; border: 1px solid #4a7fa8;"
+    )
 
     _SPINNER_CHARS = ["◐", "◓", "◑", "◒"]
 
@@ -188,7 +192,7 @@ class DatasetCuratorWindow(QWidget):
     def _on_action_button_clicked(self) -> None:
         # Clear previous-entry highlight — user is making a fresh choice
         for b in (self._btn_delete, self._btn_change, self._btn_keep):
-            b.setStyleSheet("")
+            b.setStyleSheet(self._SELECTED_STYLE if b.isChecked() else "")
         if self._btn_delete.isChecked():
             self._delete_box.show()
             self._prompt_row.hide()

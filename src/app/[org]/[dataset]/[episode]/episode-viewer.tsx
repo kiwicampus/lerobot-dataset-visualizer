@@ -1,6 +1,13 @@
 "use client";
 
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+
+// Module-level timing — persists across React remounts within the same browser session.
+let _navStartMs = 0;
+let _navFromEpisode: number | null = null;
+function navLog(msg: string, ...args: any[]) {
+  console.log(`%c[Nav] ${msg}`, "color:#5b9bd5;font-weight:bold", ...args);
+}
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { postParentMessageWithParams } from "@/utils/postParentMessage";
 import { SimpleVideosPlayer } from "@/components/simple-videos-player";
@@ -88,6 +95,9 @@ function EpisodeViewerInner({
   const [preloadVideos, setPreloadVideos] = useState<string[]>([]);
   const isLoading = !videosReady || !chartsReady;
 
+  // Tracks the HuggingFace URLs of the previous episode's videos for sliding-window cleanup.
+  const prevVideoHFUrlsRef = useRef<string[]>([]);
+
   // Keep callbacks stable so children don't re-render / re-init on every time tick.
   const handleVideosReady = useCallback(() => {
     setVideosReady(true);
@@ -96,6 +106,24 @@ function EpisodeViewerInner({
   const handleChartsReady = useCallback(() => {
     setChartsReady(true);
   }, [setChartsReady]);
+
+  // Log mount timing (server render + hydration elapsed) and which video files are used.
+  useEffect(() => {
+    const elapsed = _navStartMs > 0 ? `${(performance.now() - _navStartMs).toFixed(0)}ms` : "—";
+    const files = videosInfo
+      .map((v: any) => (v.url as string).split("/").slice(-3).join("/"))
+      .join(", ");
+    navLog(`← episode_${episodeId}  server+hydrate: ${elapsed}  videos: [${files}]`);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Log when the first video frame is ready (overlay disappears).
+  useEffect(() => {
+    if (!videosReady) return;
+    const elapsed = _navStartMs > 0 ? `${(performance.now() - _navStartMs).toFixed(0)}ms` : "—";
+    navLog(`✓ episode_${episodeId}  videos ready — total from nav: ${elapsed}`);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [videosReady]);
 
   const router = useRouter();
   const pathname = usePathname();
@@ -115,23 +143,41 @@ function EpisodeViewerInner({
     currentPage * pageSize,
   );
 
-  // Preload next episodes' videos so high-speed playback works immediately after navigation
+  // Preload next episodes' videos + sliding-window cleanup of old chunk files.
   useEffect(() => {
     if (!org || !dataset) return;
     setPreloadVideos([]);
+
+    const currentHFUrls = videosInfo.map((v: any) => v.url as string);
 
     const preloadAdjacent = async () => {
       try {
         const adjacent = await getAdjacentEpisodesVideoInfo(org, dataset, episodeId, 2);
         const currentIdx = sortedEpisodes.indexOf(Number(episodeId));
-        const urls = adjacent
-          .filter(({ episodeId: id }) => sortedEpisodes.indexOf(Number(id)) > currentIdx)
-          .flatMap(({ videosInfo: vInfo }) =>
-            vInfo.map((v: any) => getProxiedVideoUrl(v.url))
-          );
-        setPreloadVideos(urls);
+        const nextEpisodes = adjacent.filter(
+          ({ episodeId: id }) => sortedEpisodes.indexOf(Number(id)) > currentIdx,
+        );
+
+        const preloadHFUrls = nextEpisodes.flatMap(({ videosInfo: vInfo }) =>
+          vInfo.map((v: any) => v.url as string),
+        );
+        const preloadProxiedUrls = nextEpisodes.flatMap(({ videosInfo: vInfo }) =>
+          vInfo.map((v: any) => getProxiedVideoUrl(v.url)),
+        );
+
+        setPreloadVideos(preloadProxiedUrls);
+
+        // Delete cached files that are no longer in the current or next chunk.
+        const keepUrls = new Set([...currentHFUrls, ...preloadHFUrls]);
+        for (const url of prevVideoHFUrlsRef.current) {
+          if (!keepUrls.has(url) && url.startsWith("https://huggingface.co/")) {
+            fetch(`/api/video-proxy?url=${encodeURIComponent(url)}`, { method: "DELETE" }).catch(() => {});
+          }
+        }
       } catch {
         // Skip preloading on error
+      } finally {
+        prevVideoHFUrlsRef.current = currentHFUrls;
       }
     };
 
@@ -199,6 +245,8 @@ function EpisodeViewerInner({
               ? `/${org}/${dataset}/episode_${navigateTo}`
               : `./episode_${navigateTo}`;
           curatorBridgeLog("navigateTo → router.push", { navigateTo, path });
+          _navStartMs = performance.now();
+          navLog(`→ episode_${navigateTo}  (curator navigateTo)`);
           router.push(path);
           return;
         }
@@ -243,6 +291,9 @@ function EpisodeViewerInner({
             path,
             pathAtPoll: window.location.pathname,
           });
+          _navStartMs = performance.now();
+          _navFromEpisode = epSnapBefore;
+          navLog(`→ episode_${nextId}  from: ${_navFromEpisode}  (curator advance)`);
           router.push(path);
         } else {
           console.warn(
@@ -321,6 +372,9 @@ function EpisodeViewerInner({
           org && dataset
             ? `/${org}/${dataset}/episode_${nextId}`
             : `./episode_${nextId}`;
+        _navStartMs = performance.now();
+        _navFromEpisode = Number(episodeId);
+        navLog(`→ episode_${nextId}  from: ${_navFromEpisode}  (keyboard)`);
         router.push(path);
       }
     }

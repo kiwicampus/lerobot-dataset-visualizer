@@ -1,4 +1,4 @@
-import { parquetRead, parquetReadObjects } from "hyparquet";
+import { parquetRead, parquetReadObjects, asyncBufferFromUrl } from "hyparquet";
 import { parseJsonResponse } from "./jsonResponse";
 import { getAuthHeaders } from "./versionUtils";
 
@@ -86,6 +86,24 @@ export async function readParquetAsObjects(
   return parquetReadObjects({
     file: fileBuffer,
     columns: columns.length > 0 ? columns : undefined,
+  });
+}
+
+// Fetch only a specific row range from a remote parquet file using HTTP range requests.
+// Much faster than fetching the entire file when only a slice is needed.
+export async function readParquetRangeAsObjects(
+  url: string,
+  rowStart: number,
+  rowEnd: number,
+  columns?: string[],
+): Promise<Record<string, any>[]> {
+  const requestInit: RequestInit = { headers: getAuthHeaders() };
+  const asyncBuffer = await asyncBufferFromUrl({ url, requestInit });
+  return parquetReadObjects({
+    file: asyncBuffer,
+    rowStart,
+    rowEnd,
+    columns: columns && columns.length > 0 ? columns : undefined,
   });
 }
 

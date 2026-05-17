@@ -36,14 +36,14 @@ async function fetchWithRetry(
   throw lastError;
 }
 
-// Local disk cache — persists across requests in the local Next.js dev server process.
-const VIDEO_CACHE_DIR = path.join(os.tmpdir(), "lerobot-video-cache");
+// Local disk cache — persists across requests and server restarts.
+const VIDEO_CACHE_DIR = path.join(os.homedir(), ".cache", "lerobot-dataset-visualizer", "videos");
 const completedCache = new Map<string, string>();      // videoUrl → local file path
 const inProgressDownloads = new Set<string>();         // urls currently being downloaded
 
-// Limit concurrent background downloads to avoid saturating the DNS resolver.
-const MAX_CONCURRENT_DOWNLOADS = 1;
-const MAX_QUEUED_DOWNLOADS = 3; // drop requests beyond this — they'll be fetched live on demand
+// 4 cameras per episode — allow all to download concurrently.
+const MAX_CONCURRENT_DOWNLOADS = 4;
+const MAX_QUEUED_DOWNLOADS = 8;
 let _activeDownloads = 0;
 const _downloadQueue: Array<() => void> = [];
 
@@ -95,9 +95,9 @@ function startBackgroundDownload(videoUrl: string, token: string): void {
   const tmpPath = filePath + ".tmp";
 
   (async () => {
-    // Wait before competing with the live range request and RSC page fetch
-    // that triggered this download — they share the same undici connection pool.
-    await new Promise((r) => setTimeout(r, 5000));
+    // Brief pause so the initial range request gets a head start before
+    // a full-file download competes for the same connection.
+    await new Promise((r) => setTimeout(r, 500));
 
     // Another request may have cached the file during the wait.
     if (getLocalCachedFile(videoUrl)) {
@@ -215,15 +215,21 @@ export async function GET(request: NextRequest) {
   }
 
   const rangeHeader = request.headers.get("range");
+  const fileName = videoUrl.split("/").slice(-3).join("/"); // camera/chunk-000/file-003.mp4
+  const rangeStr = rangeHeader ?? "full";
 
   // Fast path: already on disk
   const localFile = getLocalCachedFile(videoUrl);
   if (localFile) {
+    console.log(`[VideoProxy] DISK  ${fileName}  ${rangeStr}`);
     return serveLocalFile(localFile, rangeHeader);
   }
 
   // Kick off background full-file download (non-blocking — does not delay this response)
   startBackgroundDownload(videoUrl, token);
+  const bgStatus = inProgressDownloads.has(videoUrl) ? "bg:downloading" : "bg:queued/dropped";
+  console.log(`[VideoProxy] LIVE  ${fileName}  ${rangeStr}  (${bgStatus})`);
+
 
   // Proxy this specific range request to HuggingFace immediately
   try {
@@ -264,12 +270,34 @@ export async function GET(request: NextRequest) {
   }
 }
 
+export async function DELETE(request: NextRequest) {
+  const videoUrl = request.nextUrl.searchParams.get("url");
+  if (!videoUrl) {
+    return NextResponse.json({ error: "Missing url parameter" }, { status: 400 });
+  }
+  if (!videoUrl.startsWith("https://huggingface.co/")) {
+    return NextResponse.json({ error: "Only HuggingFace URLs are allowed" }, { status: 403 });
+  }
+
+  const filePath = getCachePath(videoUrl);
+  completedCache.delete(videoUrl);
+  try {
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+      console.log(`[VideoCache] Deleted ${videoUrl.split("/").pop()}`);
+    }
+  } catch (e) {
+    console.warn(`[VideoCache] Could not delete cached file:`, e);
+  }
+  return new NextResponse(null, { status: 204 });
+}
+
 export async function OPTIONS() {
   return new NextResponse(null, {
     status: 200,
     headers: {
       "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, OPTIONS",
+      "Access-Control-Allow-Methods": "GET, DELETE, OPTIONS",
       "Access-Control-Allow-Headers": "Range",
     },
   });

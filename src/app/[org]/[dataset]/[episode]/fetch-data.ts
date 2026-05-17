@@ -1,13 +1,13 @@
 import {
   DatasetMetadata,
-  fetchJson,
   fetchParquetFile,
   formatStringWithVars,
   readParquetColumn,
   readParquetAsObjects,
+  readParquetRangeAsObjects,
 } from "@/utils/parquetUtils";
 import { pick } from "@/utils/pick";
-import { getDatasetVersion, buildVersionedUrl, getAuthHeaders } from "@/utils/versionUtils";
+import { getDatasetVersion, getDatasetInfo, buildVersionedUrl, getAuthHeaders } from "@/utils/versionUtils";
 import { buildVisibleEpisodesList } from "@/utils/episodeFilter";
 
 const SERIES_NAME_DELIMITER = " | ";
@@ -15,6 +15,13 @@ const SERIES_NAME_DELIMITER = " | ";
 // Cache parsed episodes parquet data — it doesn't change while the server is running.
 // Key = full parquet URL. Avoids re-fetching the same file on every episode navigation.
 const _episodesParquetCache = new Map<string, any[]>();
+
+// Cache parsed episode data — keyed by "url:fromIndex:toIndex" so each episode is fetched
+// only once per session. Range reads fetch only the needed rows (much faster than full file).
+const _dataParquetCache = new Map<string, any[]>();
+
+// Cache parsed tasks parquet — same file used for all episodes in the dataset.
+const _tasksParquetCache = new Map<string, any[]>();
 
 export async function getEpisodeData(
   org: string,
@@ -25,8 +32,7 @@ export async function getEpisodeData(
   try {
     // Check for compatible dataset version (v3.0, v2.1, or v2.0)
     const version = await getDatasetVersion(repoId);
-    const jsonUrl = buildVersionedUrl(repoId, version, "meta/info.json");
-    const info = await fetchJson<DatasetMetadata>(jsonUrl);
+    const info = await getDatasetInfo(repoId) as unknown as DatasetMetadata;
 
     if (info.video_path === null) {
       throw new Error("Only videos datasets are supported in this visualizer.\nPlease use Rerun visualizer for images datasets.");
@@ -66,8 +72,7 @@ export async function getAdjacentEpisodesVideoInfo(
   const repoId = `${org}/${dataset}`;
   try {
     const version = await getDatasetVersion(repoId);
-    const jsonUrl = buildVersionedUrl(repoId, version, "meta/info.json");
-    const info = await fetchJson<DatasetMetadata>(jsonUrl);
+    const info = await getDatasetInfo(repoId) as unknown as DatasetMetadata;
 
     const visible = buildVisibleEpisodesList(info.total_episodes);
     const centerIdx = visible.indexOf(currentEpisodeId);
@@ -102,7 +107,7 @@ export async function getAdjacentEpisodesVideoInfo(
         } else {
           const episode_chunk = Math.floor(episodeId / 1000);
           videosInfo = Object.entries(info.features)
-            .filter(([, value]) => value.dtype === "video")
+            .filter(([, value]) => (value as any).dtype === "video")
             .map(([key]) => {
               const videoPath = formatStringWithVars(info.video_path, {
                 video_key: key,
@@ -502,26 +507,26 @@ async function loadEpisodeDataV3(
   
   try {
     const dataUrl = buildVersionedUrl(repoId, version, dataPath);
-    const arrayBuffer = await fetchParquetFile(dataUrl);
-    const fullData = await readParquetAsObjects(arrayBuffer, []);
-    
-    // Extract the episode-specific data slice
-    // Convert BigInt to number if needed
     const fromIndex = Number(episodeMetadata.dataset_from_index || 0);
-    const toIndex = Number(episodeMetadata.dataset_to_index || fullData.length);
-    
-    // Find the starting index of this parquet file by checking the first row's index
-    // This handles the case where episodes are split across multiple parquet files
-    let fileStartIndex = 0;
-    if (fullData.length > 0 && fullData[0].index !== undefined) {
-      fileStartIndex = Number(fullData[0].index);
+    const toIndex = Number(episodeMetadata.dataset_to_index || 0);
+    const cacheKey = `${dataUrl}:${fromIndex}:${toIndex}`;
+
+    let episodeData: any[];
+    if (_dataParquetCache.has(cacheKey)) {
+      episodeData = _dataParquetCache.get(cacheKey)!;
+      console.log(`[DataCache] HIT   ${dataPath}  rows ${fromIndex}-${toIndex}  (${episodeData.length} rows)`);
+    } else {
+      const t0 = Date.now();
+      // Fetch only the rows belonging to this episode via HTTP range requests.
+      // For file-000 (global index starts at 0), dataset_from/to_index == local row index.
+      episodeData = await readParquetRangeAsObjects(dataUrl, fromIndex, toIndex);
+      const elapsed = Date.now() - t0;
+      console.log(`[DataCache] MISS  ${dataPath}  rows ${fromIndex}-${toIndex}  fetch: ${elapsed}ms  (${episodeData.length} rows)`);
+      if (episodeData.length > 0) _dataParquetCache.set(cacheKey, episodeData);
     }
-    
-    // Adjust indices to be relative to this file's starting position
-    const localFromIndex = Math.max(0, fromIndex - fileStartIndex);
-    const localToIndex = Math.min(fullData.length, toIndex - fileStartIndex);
-    
-    const episodeData = fullData.slice(localFromIndex, localToIndex);
+
+    // fullData alias kept so the task-lookup code below can search by episode_index
+    const fullData = episodeData;
     
     if (episodeData.length === 0) {
       return { chartDataGroups: [], ignoredColumns: [], task: undefined };
@@ -579,26 +584,47 @@ async function loadEpisodeDataV3(
     // If no language instructions found, fall back to tasks metadata
     if (!task) {
       try {
-        // Load tasks metadata
+        const episodeIdNum = Number(episodeMetadata.episode_index);
         const tasksUrl = buildVersionedUrl(repoId, version, "meta/tasks.parquet");
-        const tasksArrayBuffer = await fetchParquetFile(tasksUrl);
-        const tasksData = await readParquetAsObjects(tasksArrayBuffer, []);
-        
-        if (episodeData.length > 0 && tasksData && tasksData.length > 0) {
-          const taskIndex = episodeData[0].task_index;
-          
-          // Convert BigInt to number for comparison
-          const taskIndexNum = typeof taskIndex === 'bigint' ? Number(taskIndex) : taskIndex;
-          
-          // Look up task by index
-          if (taskIndexNum !== undefined && taskIndexNum < tasksData.length) {
-            const taskData = tasksData[taskIndexNum];
-            // Extract task from __index_level_0__ field
-            task = taskData.__index_level_0__ || taskData.task || taskData['task'] || taskData[0];
-          }
+        let tasksData: any[];
+        if (_tasksParquetCache.has(tasksUrl)) {
+          tasksData = _tasksParquetCache.get(tasksUrl)!;
+        } else {
+          const tasksArrayBuffer = await fetchParquetFile(tasksUrl);
+          tasksData = await readParquetAsObjects(tasksArrayBuffer, []);
+          if (tasksData.length > 0) _tasksParquetCache.set(tasksUrl, tasksData);
         }
-      } catch (error) {
-        // Could not load tasks metadata - dataset might not have language tasks
+
+        // Step 1: find a row in fullData with episode_index === episodeId to get its task_index
+        const dataRow = fullData.find((row) =>
+          (typeof row.episode_index === 'bigint' ? Number(row.episode_index) : Number(row.episode_index)) === episodeIdNum
+        );
+
+        if (dataRow != null && tasksData.length > 0) {
+          const taskIndexNum = typeof dataRow.task_index === 'bigint' ? Number(dataRow.task_index) : Number(dataRow.task_index);
+          console.log(`[TaskLookup] episode_index=${episodeIdNum} → task_index=${taskIndexNum}`);
+
+          // Step 2: find the row in tasks.parquet where task_index matches
+          const taskData = tasksData.find((t) =>
+            (typeof t.task_index === 'bigint' ? Number(t.task_index) : Number(t.task_index)) === taskIndexNum
+          );
+          if (taskData != null) {
+            // The task text may be in a 'task' column or in '__index_level_0__' (pandas index)
+            const taskText = taskData.task ?? taskData['__index_level_0__'];
+            if (taskText != null) {
+              task = String(taskText);
+              console.log(`[TaskLookup] resolved task: "${task.slice(0, 80)}"`);
+            } else {
+              console.warn(`[TaskLookup] no task found for task_index=${taskIndexNum} in tasks.parquet (${tasksData.length} rows)`);
+            }
+          } else {
+            console.warn(`[TaskLookup] no task found for task_index=${taskIndexNum} in tasks.parquet (${tasksData.length} rows)`);
+          }
+        } else {
+          console.warn(`[TaskLookup] no dataRow for episode_index=${episodeIdNum} in fullData (${fullData.length} rows), tasksData=${tasksData.length} rows`);
+        }
+      } catch (e) {
+        console.error(`[TaskLookup] failed:`, e);
       }
     }
     
