@@ -259,7 +259,9 @@ export const SimpleVideosPlayer = ({
       video.playbackRate = playbackSpeed;
 
       if (!isPlaying) {
-        video.pause();
+        // Let any in-flight play() settle before pausing to avoid the
+        // "play() interrupted by pause()" DOMException.
+        video.play().then(() => video.pause()).catch(() => {});
         return;
       }
 
@@ -343,7 +345,7 @@ export const SimpleVideosPlayer = ({
       videoRefs.current.forEach((v, idx) => {
         if (!v || hiddenVideos.includes(videosInfo[idx].filename)) return;
         v.playbackRate = playbackSpeed;
-        v.pause();
+        v.play().then(() => v.pause()).catch(() => {});
       });
 
       const needAhead = SPEED_UP_BUFFER_AHEAD_SEC / Math.max(1, playbackSpeed);
@@ -408,7 +410,7 @@ export const SimpleVideosPlayer = ({
         video.currentTime = segmentStart;
       }
     }
-    video.play();
+    video.play().catch(() => {});
   };
 
   return (
