@@ -9,8 +9,8 @@ Create a venv and install Next js:
 python3 -m venv .venv
 source .venv/bin/activate
 npm install
-
 pip install -r ./dataset_curator/requirements.txt
+gcloud auth application-default login --project=autonomy-286821
 ```
 
 Run the curation tool:

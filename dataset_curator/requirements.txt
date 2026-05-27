@@ -1,1 +1,4 @@
 PyQt6>=6.4.0
+flask
+google-cloud-bigquery
+google-auth
