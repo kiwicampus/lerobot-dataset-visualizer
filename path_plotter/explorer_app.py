@@ -421,6 +421,13 @@ input[type=date]{color-scheme:dark}
       <button class="btn btn-primary" style="flex-shrink:0;margin-bottom:0" onclick="lookupAndGo()">Go</button>
     </div>
     <div id="lookup-result" style="font-size:11px;margin-top:5px"></div>
+    <div class="btn-row" style="margin-top:6px">
+      <button class="btn btn-ghost" onclick="syncFromVisualizer()">↻ Sync from Visualizer</button>
+    </div>
+    <div class="toggle-row">
+      <input type="checkbox" id="toggle-live-sync" onchange="toggleLiveSync()">
+      <label for="toggle-live-sync">Live sync with visualizer</label>
+    </div>
   </div>
 
   <!-- Filters -->
@@ -873,6 +880,71 @@ async function lookupAndGo() {
   if (targetEpIdx >= 0) {
     const pl = episodeMainLayerByIdx[targetEpIdx];
     if (pl) selectEp(targetEpIdx, pl);
+  }
+}
+
+
+const BRIDGE_URL = 'http://127.0.0.1:18765';
+let _liveSyncInterval = null;
+let _lastLiveSyncEpisodeId = null;
+
+async function syncFromVisualizer() {
+  const resultEl = document.getElementById('lookup-result');
+  resultEl.style.color = '#64748b';
+  resultEl.textContent = 'Requesting episode from visualizer…';
+
+  // Ask the visualizer to re-POST its current episode (same as curator's "Sync from visualizer")
+  try {
+    await fetch(BRIDGE_URL + '/request-resync', {cache: 'no-store', mode: 'cors'});
+  } catch(e) {
+    resultEl.style.color = '#ef4444';
+    resultEl.textContent = '✗ Curator bridge not running (port 18765)';
+    return;
+  }
+
+  // Wait for the visualizer to POST back, then read the episode
+  await new Promise(r => setTimeout(r, 600));
+
+  let episodeId;
+  try {
+    const r = await fetch(BRIDGE_URL + '/current_episode', {cache: 'no-store', mode: 'cors'});
+    if (!r.ok) { resultEl.style.color = '#ef4444'; resultEl.textContent = '✗ Bridge error'; return; }
+    const d = await r.json();
+    if (d.episodeId === null || d.episodeId === undefined) {
+      resultEl.style.color = '#ef4444';
+      resultEl.textContent = '✗ No episode received yet';
+      return;
+    }
+    episodeId = d.episodeId;
+  } catch(e) {
+    resultEl.style.color = '#ef4444';
+    resultEl.textContent = '✗ Could not reach bridge';
+    return;
+  }
+
+  document.getElementById('f-dataset-index').value = episodeId;
+  await lookupAndGo();
+}
+
+function toggleLiveSync() {
+  const on = document.getElementById('toggle-live-sync').checked;
+  if (on) {
+    _lastLiveSyncEpisodeId = null;
+    _liveSyncInterval = setInterval(async () => {
+      try {
+        const r = await fetch(BRIDGE_URL + '/current_episode', {cache: 'no-store', mode: 'cors'});
+        if (!r.ok) return;
+        const d = await r.json();
+        const id = d.episodeId;
+        if (id !== null && id !== undefined && id !== _lastLiveSyncEpisodeId) {
+          _lastLiveSyncEpisodeId = id;
+          document.getElementById('f-dataset-index').value = id;
+          await lookupAndGo();
+        }
+      } catch(e) { /* bridge not running */ }
+    }, 2000);
+  } else {
+    if (_liveSyncInterval) { clearInterval(_liveSyncInterval); _liveSyncInterval = null; }
   }
 }
 
@@ -1707,6 +1779,8 @@ function resetFilters(){
   }
   document.getElementById('f-dataset-index').value = '';
   document.getElementById('lookup-result').textContent = '';
+  document.getElementById('toggle-live-sync').checked = false;
+  toggleLiveSync();
   document.getElementById('f-limit').value = '1500';
   document.getElementById('f-prompt').value = '';
   document.getElementById('f-rosbag').value = '';

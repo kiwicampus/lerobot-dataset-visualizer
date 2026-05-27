@@ -42,6 +42,7 @@ class CuratorBridge(QObject):
         self._advance_pending = False
         self._resync_from_viz_pending = False
         self._navigate_to_pending: int | None = None
+        self._last_episode_id: int | None = None
         self._sync_queue: Queue = Queue()
         # HTTP workers run in background threads; QMetaObject.invokeMethod is flaky for slots in PyQt6.
         # Drain pending /sync payloads on the GUI thread every tick (bulletproof).
@@ -77,6 +78,10 @@ class CuratorBridge(QObject):
         with self._lock:
             self._navigate_to_pending = episode_id
 
+    def get_last_episode_id(self) -> int | None:
+        with self._lock:
+            return self._last_episode_id
+
     def poll_advance_and_resync(self) -> tuple[bool, bool, int | None]:
         """One-shot read for advance, resync, and navigateTo flags."""
         with self._lock:
@@ -92,6 +97,8 @@ class CuratorBridge(QObject):
 
 
 def _enqueue_sync(bridge: CuratorBridge, episode_id: int, instruction_str: str) -> None:
+    with bridge._lock:
+        bridge._last_episode_id = episode_id
     bridge._sync_queue.put((episode_id, instruction_str))
     _dbg(
         f"enqueue sync episode_id={episode_id} "
@@ -158,6 +165,16 @@ def run_bridge_server(
                 self.send_response(204)
                 _send_cors(self)
                 self.end_headers()
+                return
+            if self.path == "/current_episode":
+                episode_id = bridge_ref.get_last_episode_id()
+                payload = json.dumps({"episodeId": episode_id}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                _send_cors(self)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
                 return
             if self.path != "/poll" and not self.path.startswith("/poll?"):
                 self.send_error(404)
