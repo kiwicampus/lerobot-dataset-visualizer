@@ -30,5 +30,5 @@ Run this 3 terminals:
 python3 path_plotter/explorer_app.py 
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser and access the dataset repo
-
+Open [http://localhost:3000](http://localhost:3000) to access the dataset visualizer
+Open [http://localhost:5050](http://localhost:5050) to access the path plotter
