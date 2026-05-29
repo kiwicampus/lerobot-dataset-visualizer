@@ -12,6 +12,8 @@ from PyQt6.QtGui import QIntValidator
 from PyQt6.QtWidgets import (
     QApplication,
     QButtonGroup,
+    QDialog,
+    QDialogButtonBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -34,6 +36,62 @@ from dataset_curator.bridge import (
 from dataset_curator.data import append_curation_row, get_curation_row, get_resume_episode, update_curation_row
 
 
+class _BulkRejectDialog(QDialog):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Bulk reject episodes")
+
+        self._from_edit = QLineEdit()
+        self._from_edit.setValidator(QIntValidator(0, 2_147_483_647, self))
+        self._to_edit = QLineEdit()
+        self._to_edit.setValidator(QIntValidator(0, 2_147_483_647, self))
+
+        self._reason_bad = QRadioButton(DatasetCuratorWindow.DELETE_REASON_BAD)
+        self._reason_nonrel = QRadioButton(DatasetCuratorWindow.DELETE_REASON_NON_RELEVANT)
+        self._reason_redundant = QRadioButton(DatasetCuratorWindow.DELETE_REASON_REDUNDANT)
+        self._reason_bad.setChecked(True)
+        reason_group = QButtonGroup(self)
+        reason_group.addButton(self._reason_bad)
+        reason_group.addButton(self._reason_nonrel)
+        reason_group.addButton(self._reason_redundant)
+        reason_box = QGroupBox("Delete reason")
+        rl = QVBoxLayout(reason_box)
+        rl.addWidget(self._reason_bad)
+        rl.addWidget(self._reason_nonrel)
+        rl.addWidget(self._reason_redundant)
+
+        form = QFormLayout()
+        form.addRow(QLabel("From (inclusive)"), self._from_edit)
+        form.addRow(QLabel("To (inclusive)"), self._to_edit)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        root = QVBoxLayout(self)
+        root.addLayout(form)
+        root.addWidget(reason_box)
+        root.addWidget(buttons)
+
+    def values(self) -> tuple[int, int, str] | None:
+        try:
+            lo = int(self._from_edit.text().strip())
+            hi = int(self._to_edit.text().strip())
+        except ValueError:
+            return None
+        if hi < lo:
+            lo, hi = hi, lo
+        if self._reason_bad.isChecked():
+            reason = DatasetCuratorWindow.DELETE_REASON_BAD
+        elif self._reason_nonrel.isChecked():
+            reason = DatasetCuratorWindow.DELETE_REASON_NON_RELEVANT
+        else:
+            reason = DatasetCuratorWindow.DELETE_REASON_REDUNDANT
+        return lo, hi, reason
+
+
 class DatasetCuratorWindow(QWidget):
     ACTION_DELETE = "Delete"
     ACTION_CHANGE_PROMPT = "Change prompt"
@@ -41,6 +99,7 @@ class DatasetCuratorWindow(QWidget):
 
     DELETE_REASON_BAD = "Bad driving"
     DELETE_REASON_NON_RELEVANT = "Non relevant actions"
+    DELETE_REASON_REDUNDANT = "Redundant information"
 
     # Style applied to the button that matches a previously saved entry
     _PREV_ENTRY_STYLE = (
@@ -101,16 +160,20 @@ class DatasetCuratorWindow(QWidget):
         self._delete_box = QGroupBox("Delete reason")
         self._delete_bad = QRadioButton(self.DELETE_REASON_BAD)
         self._delete_nonrel = QRadioButton(self.DELETE_REASON_NON_RELEVANT)
+        self._delete_redundant = QRadioButton(self.DELETE_REASON_REDUNDANT)
         self._reason_group = QButtonGroup(self)
         self._reason_group.addButton(self._delete_bad)
         self._reason_group.addButton(self._delete_nonrel)
+        self._reason_group.addButton(self._delete_redundant)
         del_layout = QVBoxLayout()
         del_layout.addWidget(self._delete_bad)
         del_layout.addWidget(self._delete_nonrel)
+        del_layout.addWidget(self._delete_redundant)
         self._delete_box.setLayout(del_layout)
         self._delete_box.hide()
         self._delete_bad.toggled.connect(self._on_inputs_changed)
         self._delete_nonrel.toggled.connect(self._on_inputs_changed)
+        self._delete_redundant.toggled.connect(self._on_inputs_changed)
 
         # Change prompt: multiline (matches visualizer language instruction)
         self._prompt_edit = QPlainTextEdit()
@@ -141,9 +204,16 @@ class DatasetCuratorWindow(QWidget):
         )
         self._goto_last_btn.clicked.connect(self._on_goto_last_saved)
 
+        self._bulk_reject_btn = QPushButton("Bulk reject…")
+        self._bulk_reject_btn.setToolTip(
+            "Mark a contiguous range of episodes as Delete with a chosen reason."
+        )
+        self._bulk_reject_btn.clicked.connect(self._on_bulk_reject)
+
         sync_row = QHBoxLayout()
         sync_row.addWidget(self._reload_viz_btn)
         sync_row.addWidget(self._goto_last_btn)
+        sync_row.addWidget(self._bulk_reject_btn)
 
         self._nav_label = QLabel("")
         self._nav_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -202,6 +272,7 @@ class DatasetCuratorWindow(QWidget):
             self._reason_group.setExclusive(False)
             self._delete_bad.setChecked(False)
             self._delete_nonrel.setChecked(False)
+            self._delete_redundant.setChecked(False)
             self._reason_group.setExclusive(True)
             self._prompt_row.show()
             self._prompt_edit.blockSignals(True)
@@ -212,6 +283,7 @@ class DatasetCuratorWindow(QWidget):
             self._reason_group.setExclusive(False)
             self._delete_bad.setChecked(False)
             self._delete_nonrel.setChecked(False)
+            self._delete_redundant.setChecked(False)
             self._reason_group.setExclusive(True)
             self._prompt_row.hide()
             self._prompt_edit.clear()
@@ -246,6 +318,8 @@ class DatasetCuratorWindow(QWidget):
                 return self.DELETE_REASON_BAD
             if self._delete_nonrel.isChecked():
                 return self.DELETE_REASON_NON_RELEVANT
+            if self._delete_redundant.isChecked():
+                return self.DELETE_REASON_REDUNDANT
             return None
         if act == self.ACTION_CHANGE_PROMPT:
             t = self._prompt_edit.toPlainText().strip()
@@ -280,14 +354,16 @@ class DatasetCuratorWindow(QWidget):
             for b in (self._btn_delete, self._btn_change, self._btn_keep):
                 b.setChecked(False)
             self._action_group.setExclusive(True)
-            self._delete_box.hide()
             self._reason_group.setExclusive(False)
             self._delete_bad.setChecked(False)
             self._delete_nonrel.setChecked(False)
+            self._delete_redundant.setChecked(False)
             self._reason_group.setExclusive(True)
-            self._prompt_row.hide()
             self._prompt_edit.clear()
-            self._on_inputs_changed()
+            # Default to Keep so a single Save click marks the episode as kept.
+            # Use click() so the same path as a real user click runs:
+            # stylesheets, delete/prompt-row visibility, and _on_inputs_changed.
+            self._btn_keep.click()
             return
 
         action, detail = existing
@@ -304,6 +380,8 @@ class DatasetCuratorWindow(QWidget):
                 self._delete_bad.setChecked(True)
             elif detail == self.DELETE_REASON_NON_RELEVANT:
                 self._delete_nonrel.setChecked(True)
+            elif detail == self.DELETE_REASON_REDUNDANT:
+                self._delete_redundant.setChecked(True)
         elif action == self.ACTION_CHANGE_PROMPT:
             self._btn_change.blockSignals(True)
             self._btn_change.setChecked(True)
@@ -313,6 +391,7 @@ class DatasetCuratorWindow(QWidget):
             self._reason_group.setExclusive(False)
             self._delete_bad.setChecked(False)
             self._delete_nonrel.setChecked(False)
+            self._delete_redundant.setChecked(False)
             self._reason_group.setExclusive(True)
             self._prompt_row.show()
             self._prompt_edit.blockSignals(True)
@@ -327,6 +406,7 @@ class DatasetCuratorWindow(QWidget):
             self._reason_group.setExclusive(False)
             self._delete_bad.setChecked(False)
             self._delete_nonrel.setChecked(False)
+            self._delete_redundant.setChecked(False)
             self._reason_group.setExclusive(True)
             self._prompt_row.hide()
             self._prompt_edit.clear()
@@ -380,6 +460,7 @@ class DatasetCuratorWindow(QWidget):
         self._reason_group.setExclusive(False)
         self._delete_bad.setChecked(False)
         self._delete_nonrel.setChecked(False)
+        self._delete_redundant.setChecked(False)
         self._reason_group.setExclusive(True)
         self._prompt_edit.clear()
         self._prompt_row.hide()
@@ -407,7 +488,7 @@ class DatasetCuratorWindow(QWidget):
         for w in (
             self._episode_edit,
             self._btn_delete, self._btn_change, self._btn_keep,
-            self._save_btn, self._goto_last_btn,
+            self._save_btn, self._goto_last_btn, self._bulk_reject_btn,
         ):
             w.setEnabled(not navigating)
         if not navigating:
@@ -425,6 +506,84 @@ class DatasetCuratorWindow(QWidget):
         curator_debug(f"Go to last saved → navigateTo={episode}")
         self._bridge.request_navigate_to(episode)
         self._set_navigating(True, f"Navigating to episode {episode}...")
+
+    def _on_bulk_reject(self) -> None:
+        dlg = _BulkRejectDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        vals = dlg.values()
+        if vals is None:
+            QMessageBox.warning(self, "Bulk reject", "Please enter valid From and To indices.")
+            return
+        lo, hi, reason = vals
+        indices = list(range(lo, hi + 1))
+
+        existing: list[tuple[int, str, str]] = []
+        for i in indices:
+            row = get_curation_row(i)
+            if row is not None:
+                existing.append((i, row[0], row[1]))
+
+        overwrite = False
+        targets = list(indices)
+        if existing:
+            sample = ", ".join(str(i) for i, _, _ in existing[:10])
+            more = "" if len(existing) <= 10 else f" (+{len(existing) - 10} more)"
+            box = QMessageBox(self)
+            box.setWindowTitle("Existing entries in range")
+            box.setText(
+                f"{len(existing)} of {len(indices)} episodes in [{lo}, {hi}] "
+                f"already have a curation entry.\n\nIndices: {sample}{more}"
+            )
+            skip_btn = box.addButton("Skip existing", QMessageBox.ButtonRole.AcceptRole)
+            over_btn = box.addButton("Overwrite all", QMessageBox.ButtonRole.DestructiveRole)
+            box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is skip_btn:
+                existing_set = {i for i, _, _ in existing}
+                targets = [i for i in indices if i not in existing_set]
+            elif clicked is over_btn:
+                overwrite = True
+            else:
+                return
+
+        confirm = QMessageBox.question(
+            self,
+            "Confirm bulk reject",
+            f"Mark {len(targets)} episodes in [{lo}, {hi}] as Delete "
+            f"(reason: {reason})?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        existing_set = {i for i, _, _ in existing}
+        written = 0
+        try:
+            for i in targets:
+                if i in existing_set:
+                    update_curation_row(i, self.ACTION_DELETE, reason)
+                else:
+                    append_curation_row(i, self.ACTION_DELETE, reason)
+                written += 1
+        except OSError as e:
+            QMessageBox.critical(
+                self,
+                "Bulk reject failed",
+                f"Wrote {written} of {len(targets)} before error:\n{e}",
+            )
+            return
+
+        QMessageBox.information(
+            self,
+            "Bulk reject done",
+            f"Marked {written} episodes as Delete ({reason}).",
+        )
+        # Refresh form if the currently-displayed episode is in the affected range
+        cur = self._episode_index_value()
+        if cur is not None and lo <= cur <= hi and (overwrite or cur not in existing_set):
+            self._load_episode_curation(cur)
 
     def _on_sync_from_visualizer(self) -> None:
         port = int(os.environ.get("CURATOR_BRIDGE_PORT", str(DEFAULT_BRIDGE_PORT)))
