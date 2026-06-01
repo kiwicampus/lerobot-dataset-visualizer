@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QIntValidator
@@ -210,10 +212,17 @@ class DatasetCuratorWindow(QWidget):
         )
         self._bulk_reject_btn.clicked.connect(self._on_bulk_reject)
 
+        self._delete_cache_btn = QPushButton("Delete cache")
+        self._delete_cache_btn.setToolTip(
+            "Delete all cached video files from ~/.cache/lerobot-dataset-visualizer/videos/"
+        )
+        self._delete_cache_btn.clicked.connect(self._on_delete_cache)
+
         sync_row = QHBoxLayout()
         sync_row.addWidget(self._reload_viz_btn)
         sync_row.addWidget(self._goto_last_btn)
         sync_row.addWidget(self._bulk_reject_btn)
+        sync_row.addWidget(self._delete_cache_btn)
 
         self._nav_label = QLabel("")
         self._nav_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -584,6 +593,28 @@ class DatasetCuratorWindow(QWidget):
         cur = self._episode_index_value()
         if cur is not None and lo <= cur <= hi and (overwrite or cur not in existing_set):
             self._load_episode_curation(cur)
+
+    def _on_delete_cache(self) -> None:
+        cache_dir = Path.home() / ".cache" / "lerobot-dataset-visualizer" / "videos"
+        if not cache_dir.exists():
+            QMessageBox.information(self, "Delete cache", "The video cache is already empty.")
+            return
+        size_bytes = sum(f.stat().st_size for f in cache_dir.rglob("*") if f.is_file())
+        size_gb = size_bytes / 1024 ** 3
+        reply = QMessageBox.question(
+            self,
+            "Delete cache",
+            f"Delete all cached videos?\n\n{size_gb:.1f} GB will be freed.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            shutil.rmtree(cache_dir)
+        except OSError as e:
+            QMessageBox.critical(self, "Delete cache failed", str(e))
+            return
+        QMessageBox.information(self, "Delete cache", f"Deleted {size_gb:.1f} GB of cached videos.")
 
     def _on_sync_from_visualizer(self) -> None:
         port = int(os.environ.get("CURATOR_BRIDGE_PORT", str(DEFAULT_BRIDGE_PORT)))
