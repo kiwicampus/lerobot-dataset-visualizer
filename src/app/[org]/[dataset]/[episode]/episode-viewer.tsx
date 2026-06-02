@@ -152,7 +152,7 @@ function EpisodeViewerInner({
 
     const preloadAdjacent = async () => {
       try {
-        const adjacent = await getAdjacentEpisodesVideoInfo(org, dataset, episodeId, 2);
+        const adjacent = await getAdjacentEpisodesVideoInfo(org, dataset, episodeId, 10);
         const currentIdx = sortedEpisodes.indexOf(Number(episodeId));
         const nextEpisodes = adjacent.filter(
           ({ episodeId: id }) => sortedEpisodes.indexOf(Number(id)) > currentIdx,
