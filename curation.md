@@ -10,7 +10,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 npm install
 pip install -r ./dataset_curator/requirements.txt
-gcloud auth application-default login --project=autonomy-286821
+(optional) gcloud auth application-default login --project=autonomy-286821
 ```
 
 Run this 3 terminals: 
@@ -25,7 +25,7 @@ Run this 3 terminals:
    npm run dev
 ```
 
-3) Run the path plotter tool: 
+3) Run the path plotter tool (optional): 
 ```bash 
 python3 path_plotter/explorer_app.py 
 ```
