@@ -536,7 +536,12 @@ export const SimpleVideosPlayer = ({
                     isEnlarged ? "max-h-[90vh] max-w-[90vw]" : ""
                   }`}
                   muted
-                  preload="auto"
+                  // metadata only: these are 500MB concatenated files. "auto" makes the
+                  // browser open speculative buffer-ahead range requests and read them
+                  // slowly while paused, holding the ~6 connection slots open for tens of
+                  // seconds and starving the other cameras. Metadata is enough to mark the
+                  // segment ready (overlay clears); playback buffers on demand.
+                  preload="metadata"
                   onPlay={(e) => handlePlay(e.currentTarget, info)}
                 >
                   <source src={getProxiedVideoUrl(info.url)} type="video/mp4" />

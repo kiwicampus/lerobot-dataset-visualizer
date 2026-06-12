@@ -4,7 +4,7 @@ import {
   formatStringWithVars,
   readParquetColumn,
   readParquetAsObjects,
-  readParquetRangeAsObjects,
+  readParquetRangeFromBuffer,
 } from "@/utils/parquetUtils";
 import { pick } from "@/utils/pick";
 import { getDatasetVersion, getDatasetInfo, buildVersionedUrl, getAuthHeaders } from "@/utils/versionUtils";
@@ -22,6 +22,36 @@ const _dataParquetCache = new Map<string, any[]>();
 
 // Cache parsed tasks parquet — same file used for all episodes in the dataset.
 const _tasksParquetCache = new Map<string, any[]>();
+
+// Cache the WHOLE data parquet file buffer — one ~25MB file is shared by every episode,
+// so we fetch it once and slice each episode's row range from memory (no per-episode HF
+// round-trips). _dataFileInflight dedupes concurrent fetches (e.g. dev double-render or
+// preload + nav hitting the same file before it's cached).
+const _dataFileBufferCache = new Map<string, ArrayBuffer>();
+const _dataFileInflight = new Map<string, Promise<ArrayBuffer>>();
+
+async function getDataFileBuffer(dataUrl: string): Promise<ArrayBuffer> {
+  const cached = _dataFileBufferCache.get(dataUrl);
+  if (cached) return cached;
+
+  const inflight = _dataFileInflight.get(dataUrl);
+  if (inflight) return inflight;
+
+  const t0 = Date.now();
+  const promise = fetchParquetFile(dataUrl)
+    .then((buf) => {
+      _dataFileBufferCache.set(dataUrl, buf);
+      _dataFileInflight.delete(dataUrl);
+      console.log(`[DataFile] DOWNLOADED ${dataUrl.split("/").slice(-2).join("/")}  ${(buf.byteLength / 1e6).toFixed(1)}MB  in ${Date.now() - t0}ms — all episodes now served from memory`);
+      return buf;
+    })
+    .catch((err) => {
+      _dataFileInflight.delete(dataUrl);
+      throw err;
+    });
+  _dataFileInflight.set(dataUrl, promise);
+  return promise;
+}
 
 export async function getEpisodeData(
   org: string,
@@ -517,11 +547,13 @@ async function loadEpisodeDataV3(
       console.log(`[DataCache] HIT   ${dataPath}  rows ${fromIndex}-${toIndex}  (${episodeData.length} rows)`);
     } else {
       const t0 = Date.now();
-      // Fetch only the rows belonging to this episode via HTTP range requests.
-      // For file-000 (global index starts at 0), dataset_from/to_index == local row index.
-      episodeData = await readParquetRangeAsObjects(dataUrl, fromIndex, toIndex);
+      // Fetch the whole data file once (cached + in-flight deduped), then slice this
+      // episode's rows from memory. For file-000 (global index starts at 0),
+      // dataset_from/to_index == local row index.
+      const fileBuffer = await getDataFileBuffer(dataUrl);
+      episodeData = await readParquetRangeFromBuffer(fileBuffer, fromIndex, toIndex);
       const elapsed = Date.now() - t0;
-      console.log(`[DataCache] MISS  ${dataPath}  rows ${fromIndex}-${toIndex}  fetch: ${elapsed}ms  (${episodeData.length} rows)`);
+      console.log(`[DataCache] MISS  ${dataPath}  rows ${fromIndex}-${toIndex}  read: ${elapsed}ms  (${episodeData.length} rows)`);
       if (episodeData.length > 0) _dataParquetCache.set(cacheKey, episodeData);
     }
 

@@ -107,6 +107,23 @@ export async function readParquetRangeAsObjects(
   });
 }
 
+// Read a row range from an already-fetched in-memory parquet buffer (no network).
+// Use when the same file is sliced repeatedly (e.g. one data file shared by all episodes):
+// fetch the whole file once, then call this per episode.
+export async function readParquetRangeFromBuffer(
+  fileBuffer: ArrayBuffer,
+  rowStart: number,
+  rowEnd: number,
+  columns?: string[],
+): Promise<Record<string, any>[]> {
+  return parquetReadObjects({
+    file: fileBuffer,
+    rowStart,
+    rowEnd,
+    columns: columns && columns.length > 0 ? columns : undefined,
+  });
+}
+
 // Convert a 2D array to a CSV string
 export function arrayToCSV(data: (number | string)[][]): string {
   return data.map((row) => row.join(",")).join("\n");

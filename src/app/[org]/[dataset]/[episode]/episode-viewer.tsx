@@ -152,7 +152,11 @@ function EpisodeViewerInner({
 
     const preloadAdjacent = async () => {
       try {
-        const adjacent = await getAdjacentEpisodesVideoInfo(org, dataset, episodeId, 2);
+        // Radius 1: prefetch ONLY the immediate next episode. With one slow HF pipe and
+        // low download concurrency, prefetching further ahead would steal bandwidth from
+        // the file you're currently waiting on. The next episode's files download from
+        // leftover capacity while you curate; deeper look-ahead isn't worth the contention.
+        const adjacent = await getAdjacentEpisodesVideoInfo(org, dataset, episodeId, 1);
         const currentIdx = sortedEpisodes.indexOf(Number(episodeId));
         const nextEpisodes = adjacent.filter(
           ({ episodeId: id }) => sortedEpisodes.indexOf(Number(id)) > currentIdx,
@@ -220,7 +224,10 @@ function EpisodeViewerInner({
     let timeoutId: number | undefined;
 
     const schedule = () => {
-      timeoutId = window.setTimeout(run, 350);
+      // Poll the curator bridge often so a Save is detected (and navigation kicks off)
+      // within ~120ms instead of up to 350ms. The poll hits the Python bridge directly,
+      // so it's cheap and never queues behind the Next server's video I/O.
+      timeoutId = window.setTimeout(run, 120);
     };
 
     function currentEpisodeFromBrowserPath(): number | null {
@@ -395,6 +402,13 @@ function EpisodeViewerInner({
 
   return (
     <div className="flex h-screen max-h-screen bg-slate-950 text-gray-200">
+      {/* Live "what is the switch waiting for" indicator */}
+      <VideoCacheStatus
+        videosInfo={videosInfo}
+        videosReady={videosReady}
+        chartsReady={chartsReady}
+      />
+
       {/* Sidebar */}
       <Sidebar
         datasetInfo={datasetInfo}
@@ -485,7 +499,10 @@ function EpisodeViewerInner({
           <video
             key={url}
             src={url}
-            preload="auto"
+            // metadata only: warms the proxy disk cache with one request instead of
+            // buffer-ahead flooding dozens of range requests for the NEXT episode, which
+            // starved the CURRENT episode's cameras of the browser's ~6 connection slots.
+            preload="metadata"
             muted
             playsInline
             style={{ position: "absolute", width: 0, height: 0, opacity: 0, pointerEvents: "none" }}
@@ -501,6 +518,107 @@ function EpisodeViewerInner({
           />
         );
       })}
+    </div>
+  );
+}
+
+type CamStatus = {
+  state: "cached" | "downloading" | "starting" | "cold" | "?";
+  received?: number;
+  total?: number;
+  pct?: number;
+};
+
+// Live indicator: polls the proxy for each camera's cache state so the user can SEE
+// exactly what a slow episode switch is waiting for (which 500MB file is still
+// downloading from HuggingFace, and how far along). Auto-hides once everything is
+// cached and the page is fully ready.
+function VideoCacheStatus({
+  videosInfo,
+  videosReady,
+  chartsReady,
+}: {
+  videosInfo: any[];
+  videosReady: boolean;
+  chartsReady: boolean;
+}) {
+  const [statuses, setStatuses] = useState<Record<string, CamStatus>>({});
+
+  useEffect(() => {
+    let cancelled = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      try {
+        const entries = await Promise.all(
+          videosInfo.map(async (v: any) => {
+            try {
+              const r = await fetch(
+                `/api/video-proxy?status=1&url=${encodeURIComponent(v.url)}`,
+                { cache: "no-store" },
+              );
+              return [v.filename, (await r.json()) as CamStatus] as const;
+            } catch {
+              return [v.filename, { state: "?" } as CamStatus] as const;
+            }
+          }),
+        );
+        if (!cancelled) setStatuses(Object.fromEntries(entries));
+      } finally {
+        if (!cancelled) timer = window.setTimeout(poll, 700);
+      }
+    };
+    poll();
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [videosInfo]);
+
+  const allCached = videosInfo.every(
+    (v: any) => statuses[v.filename]?.state === "cached",
+  );
+  if (allCached && videosReady && chartsReady) return null;
+
+  const describe = (s?: CamStatus): string => {
+    if (!s) return "…";
+    switch (s.state) {
+      case "cached":
+        return "✓ cached";
+      case "downloading":
+        return `⬇ ${s.pct ?? 0}%  ${((s.received ?? 0) / 1e6).toFixed(0)}/${((s.total ?? 0) / 1e6).toFixed(0)} MB`;
+      case "starting":
+        return "⬇ starting…";
+      case "cold":
+        return "• not downloaded";
+      default:
+        return "…";
+    }
+  };
+  const colorFor = (s?: CamStatus): string =>
+    s?.state === "cached"
+      ? "text-green-400"
+      : s?.state === "downloading" || s?.state === "starting"
+        ? "text-amber-300"
+        : "text-slate-400";
+
+  return (
+    <div
+      style={{ position: "fixed", top: 12, right: 12, zIndex: 9999 }}
+      className="bg-black/90 border-2 border-amber-400 rounded-lg p-3 text-sm font-mono text-slate-100 shadow-2xl pointer-events-none min-w-[260px]"
+    >
+      <div className="font-bold mb-1 text-amber-300">⏳ Waiting on…</div>
+      {videosInfo.map((v: any) => {
+        const s = statuses[v.filename];
+        const cam = String(v.filename).replace("observation.image.", "");
+        return (
+          <div key={v.filename} className={colorFor(s)}>
+            {cam}: {describe(s)}
+          </div>
+        );
+      })}
+      <div className={chartsReady ? "text-green-400" : "text-amber-300"}>
+        charts: {chartsReady ? "✓ ready" : "… computing"}
+      </div>
     </div>
   );
 }

@@ -15,7 +15,7 @@ type TimeContextType = {
   setDuration: React.Dispatch<React.SetStateAction<number>>;
 };
 
-export const PLAYBACK_SPEEDS = [2, 5, 10] as const;
+export const PLAYBACK_SPEEDS = [5, 10, 16] as const;
 export type PlaybackSpeed = (typeof PLAYBACK_SPEEDS)[number];
 
 type PlaybackContextType = {
@@ -72,7 +72,7 @@ export const TimeProvider: React.FC<{
   );
 
   const [isPlaying, setIsPlaying] = useState(false);
-  const [playbackSpeed, setPlaybackSpeed] = useState<PlaybackSpeed>(10);
+  const [playbackSpeed, setPlaybackSpeed] = useState<PlaybackSpeed>(16);
 
   const playbackValue = useMemo(
     () => ({

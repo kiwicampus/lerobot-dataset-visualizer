@@ -22,6 +22,13 @@ import React, { useMemo } from "react";
 // Use the same delimiter as the data processing
 const SERIES_NAME_DELIMITER = " | ";
 
+// Waypoint series are lat/lon — render with 8 decimals; everything else stays at 2.
+const formatSeriesValue = (key: string, value: unknown): string => {
+  if (typeof value !== "number") return "--";
+  const decimals = /waypoint/i.test(key) ? 8 : 2;
+  return value.toFixed(decimals);
+};
+
 export const DataRecharts = React.memo(
   ({ data, onChartsReady }: DataGraphProps) => {
     // Shared hoveredTime for all graphs
@@ -219,7 +226,7 @@ const SingleDataGraph = React.memo(
                       />
                       <span className={`text-xs break-all w-36 ${visibleKeys.includes(key) ? "text-white" : "text-gray-400"}`}>{key.slice(group.length + 1)}</span>
                       <span className={`text-xs font-mono ml-auto ${visibleKeys.includes(key) ? "text-orange-300" : "text-gray-500"}`}>
-                        {typeof currentData[key] === "number" ? currentData[key].toFixed(2) : "--"}
+                        {formatSeriesValue(key, currentData[key])}
                       </span>
                     </label>
                   ))}
@@ -241,7 +248,7 @@ const SingleDataGraph = React.memo(
                 />
                 <span className={`text-sm break-all w-40 ${visibleKeys.includes(key) ? "text-white" : "text-gray-400"}`}>{key}</span>
                 <span className={`text-sm font-mono ml-auto ${visibleKeys.includes(key) ? "text-orange-300" : "text-gray-500"}`}>
-                  {typeof currentData[key] === "number" ? currentData[key].toFixed(2) : "--"}
+                  {formatSeriesValue(key, currentData[key])}
                 </span>
               </label>
             );

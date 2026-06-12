@@ -40,10 +40,14 @@ async function fetchWithRetry(
 const VIDEO_CACHE_DIR = path.join(os.homedir(), ".cache", "lerobot-dataset-visualizer", "videos");
 const completedCache = new Map<string, string>();      // videoUrl → local file path
 const inProgressDownloads = new Set<string>();         // urls currently being downloaded
+const downloadProgress = new Map<string, { received: number; total: number }>(); // live byte progress
 
-// 4 cameras per episode — allow all to download concurrently.
-const MAX_CONCURRENT_DOWNLOADS = 4;
-const MAX_QUEUED_DOWNLOADS = 8;
+// Keep concurrency LOW. With one slow HF pipe, running many downloads at once just
+// splits the bandwidth so the file you're actually waiting for crawls. The current
+// episode's files are requested first (on navigation), so they win these slots;
+// prefetch of the next episode queues behind them and only uses leftover bandwidth.
+const MAX_CONCURRENT_DOWNLOADS = 2;
+const MAX_QUEUED_DOWNLOADS = 32;
 let _activeDownloads = 0;
 const _downloadQueue: Array<() => void> = [];
 
@@ -125,12 +129,18 @@ function startBackgroundDownload(videoUrl: string, token: string): void {
         throw new Error(`HuggingFace returned ${response.status}`);
       }
 
+      const total = Number(response.headers.get("content-length")) || 0;
+      let received = 0;
+      downloadProgress.set(videoUrl, { received: 0, total });
+
       const fileStream = fs.createWriteStream(tmpPath);
       const reader = response.body.getReader();
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
         fileStream.write(value);
+        received += value.length;
+        downloadProgress.set(videoUrl, { received, total });
       }
       await new Promise<void>((resolve, reject) => {
         fileStream.end();
@@ -148,21 +158,78 @@ function startBackgroundDownload(videoUrl: string, token: string): void {
     } finally {
       releaseDownloadSlot();
       inProgressDownloads.delete(videoUrl);
+      downloadProgress.delete(videoUrl);
     }
   })();
 }
 
-function serveLocalFile(filePath: string, rangeHeader: string | null): NextResponse {
+// Cap how many bytes a single range response streams. These are 500MB whole-chunk
+// videos; an open-ended `bytes=START-` request would otherwise stream the entire tail
+// (hundreds of MB) for one episode seek. The browser re-requests further ranges as it
+// plays, so a bounded window keeps each response small and fast.
+const MAX_RANGE_CHUNK = 8 * 1024 * 1024; // 8 MB
+
+// Wrap a Node read stream as a web ReadableStream that STOPS reading the moment the
+// client disconnects (cancel / abort). Without this, the fs stream keeps reading to EOF
+// and throws "Invalid state: Controller is already closed" on every aborted seek —
+// burning CPU/disk on data nobody is waiting for.
+function nodeStreamToWeb(
+  nodeStream: fs.ReadStream,
+  signal?: AbortSignal,
+): ReadableStream {
+  const destroy = () => {
+    if (!nodeStream.destroyed) nodeStream.destroy();
+  };
+  if (signal) {
+    if (signal.aborted) destroy();
+    else signal.addEventListener("abort", destroy, { once: true });
+  }
+  return new ReadableStream({
+    start(controller) {
+      nodeStream.on("data", (chunk) => {
+        try {
+          controller.enqueue(chunk);
+        } catch {
+          destroy(); // controller already closed → client gone
+          return;
+        }
+        if (controller.desiredSize !== null && controller.desiredSize <= 0) {
+          nodeStream.pause();
+        }
+      });
+      nodeStream.on("end", () => {
+        try { controller.close(); } catch { /* already closed */ }
+      });
+      nodeStream.on("error", (err) => {
+        try { controller.error(err); } catch { /* already closed */ }
+      });
+    },
+    pull() {
+      nodeStream.resume();
+    },
+    cancel() {
+      destroy();
+    },
+  });
+}
+
+function serveLocalFile(
+  filePath: string,
+  rangeHeader: string | null,
+  signal?: AbortSignal,
+): NextResponse {
   const fileSize = fs.statSync(filePath).size;
 
   if (rangeHeader) {
     const match = rangeHeader.match(/bytes=(\d+)-(\d*)/);
     if (match) {
       const start = parseInt(match[1], 10);
-      const end = match[2] ? parseInt(match[2], 10) : fileSize - 1;
+      const requestedEnd = match[2] ? parseInt(match[2], 10) : fileSize - 1;
+      // Bound the response so we never stream the whole 500MB tail at once.
+      const end = Math.min(requestedEnd, start + MAX_RANGE_CHUNK - 1, fileSize - 1);
       const chunkSize = end - start + 1;
       const nodeStream = fs.createReadStream(filePath, { start, end });
-      return new NextResponse(Readable.toWeb(nodeStream) as ReadableStream, {
+      return new NextResponse(nodeStreamToWeb(nodeStream, signal), {
         status: 206,
         headers: {
           "Content-Type": "video/mp4",
@@ -177,7 +244,7 @@ function serveLocalFile(filePath: string, rangeHeader: string | null): NextRespo
   }
 
   const nodeStream = fs.createReadStream(filePath);
-  return new NextResponse(Readable.toWeb(nodeStream) as ReadableStream, {
+  return new NextResponse(nodeStreamToWeb(nodeStream, signal), {
     status: 200,
     headers: {
       "Content-Type": "video/mp4",
@@ -209,6 +276,30 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: "Only HuggingFace URLs are allowed" }, { status: 403 });
   }
 
+  // Lightweight status probe for the UI: is this camera's file cached, downloading, or cold?
+  if (request.nextUrl.searchParams.get("status")) {
+    const cached = !!getLocalCachedFile(videoUrl);
+    const prog = downloadProgress.get(videoUrl);
+    let state: "cached" | "downloading" | "starting" | "cold";
+    let received = 0;
+    let total = 0;
+    if (cached) {
+      state = "cached";
+    } else if (prog) {
+      state = "downloading";
+      received = prog.received;
+      total = prog.total;
+    } else if (inProgressDownloads.has(videoUrl)) {
+      state = "starting";
+    } else {
+      state = "cold";
+    }
+    return NextResponse.json(
+      { state, received, total, pct: total ? Math.round((received / total) * 100) : 0 },
+      { headers: { "Access-Control-Allow-Origin": "*", "Cache-Control": "no-store" } },
+    );
+  }
+
   const token = getHFToken();
   if (!token) {
     return NextResponse.json({ error: "No HuggingFace token available" }, { status: 401 });
@@ -222,7 +313,7 @@ export async function GET(request: NextRequest) {
   const localFile = getLocalCachedFile(videoUrl);
   if (localFile) {
     console.log(`[VideoProxy] DISK  ${fileName}  ${rangeStr}`);
-    return serveLocalFile(localFile, rangeHeader);
+    return serveLocalFile(localFile, rangeHeader, request.signal);
   }
 
   // Kick off background full-file download (non-blocking — does not delay this response)
